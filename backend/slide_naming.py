@@ -60,13 +60,23 @@ def file_uuid_from_raw_path(raw_path):
 # Stage 1's CSV, and neither could match the TCGA rows already loaded. Both
 # sides go through here instead.
 #
-# This does NOT repair a tile name that is missing its extension. The fix for
-# that belongs in make_hpl_hdf5.py, which is where the suffix was being dropped;
-# quietly appending one here would let a .h5 packaged before that fix produce a
-# key that matches, while its (slides, tiles) columns still disagree with Kai's
-# reference CSV and so still fail the acceptance test. Use tiles_missing_suffix()
-# to refuse such a file instead.
+# The key builders below do NOT repair a tile name that is missing its
+# extension, and that is deliberate: a key repaired in place would match while
+# the (slides, tiles) columns it was built from still disagree with Kai's
+# reference CSV, and a rule that appends ".jpeg" to anything unsuffixed would
+# also "fix" a name that legitimately is not one.
+#
+# Repair happens one level up instead, at the boundaries that read an artifact
+# off disk — normalize_tile_names() below, called by register_dataset.py and
+# load_hpc_assignments.py, which append the suffix explicitly, count what they
+# touched and report it. That keeps the correction visible and keeps it out of
+# the key definition. The source fix is still make_hpl_hdf5.py, which is where
+# the suffix was being dropped.
 _TILE_SUFFIX = ".JPEG"
+
+# What normalize_tile_names() appends. Lower case, because it is a filename —
+# _TILE_SUFFIX above is upper only because the join key is upper-cased whole.
+_TILE_SUFFIX_LOWER = ".jpeg"
 
 # Only the tile part is ever inspected for an extension. A slide name may itself
 # contain dots — a real one is "BB232560 A3-1 - 2023-10-11 16.41.02" — so
@@ -115,3 +125,52 @@ def tiles_missing_suffix(tiles) -> bool:
     if not sample:
         return False
     return not any(_HAS_EXTENSION_RE.search(t) for t in sample)
+
+
+def tile_name_verdict(tiles) -> str:
+    """"short" (none carry an extension), "done" (all do), or "mixed".
+
+    Reads every name rather than sampling the first 100 the way
+    tiles_missing_suffix() does. That sampling is why a mixed file — some names
+    suffixed, some not — reads as "not missing" to the guard and passes it
+    silently. Mixed is the one state that cannot be repaired: it is what a
+    resume straddling the tile-name fix leaves behind, and the rows on either
+    side of that boundary are indistinguishable by name, so appending a suffix
+    would mislabel real tiles. Callers refuse it.
+
+    Blank names are ignored, and all-blank counts as "done" — there is nothing
+    to append to, and calling that "short" would send a caller off to migrate a
+    file whose tile column is empty for an entirely different reason.
+    """
+    names = [t for t in (_as_text(v) for v in tiles) if t]
+    if not names:
+        return "done"
+    with_suffix = sum(1 for n in names if _HAS_EXTENSION_RE.search(n))
+    if with_suffix == 0:
+        return "short"
+    if with_suffix == len(names):
+        return "done"
+    return "mixed"
+
+
+def normalize_tile_names(tiles) -> tuple[list[str], int]:
+    """(names with ".jpeg" appended where absent, how many were changed).
+
+    Only ever appends — a name that already carries any extension is returned
+    untouched, so a .png or .tiff is left alone rather than turned into
+    "24_10.png.jpeg". Safe because auto_tile_from_mask.py:150 hardcodes
+    f"{col}_{row}.jpeg" for every tile this pipeline has ever written, which
+    makes "24_10" -> "24_10.jpeg" a bijection rather than a guess.
+
+    Does not itself refuse a mixed set — check tile_name_verdict() first. This
+    returns a count so the caller can report the correction instead of making it
+    silently.
+    """
+    out, changed = [], 0
+    for value in tiles:
+        name = _as_text(value)
+        if name and not _HAS_EXTENSION_RE.search(name):
+            name += _TILE_SUFFIX_LOWER
+            changed += 1
+        out.append(name)
+    return out, changed

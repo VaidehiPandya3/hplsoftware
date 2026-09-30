@@ -306,11 +306,20 @@ def first_hpc_id(plan: dict[str, Any]) -> int | None:
 
 
 def should_fetch_from_db(plan: dict[str, Any]) -> bool:
-    if plan.get("intent") in ("general_query", "greeting", "help"):
-        return False
+    # Checked before the intent short-circuit below, not after: a message
+    # like "Hello, tell me about HPC 40" opens with a greeting word but names
+    # a real entity, and greeting/help/general_query is exactly the intent
+    # the regex planner assigns whenever a greeting word appears anywhere in
+    # the message (see build_query_plan_regex) — so checking intent first
+    # discarded the HPC lookup entirely. explain_answer() already prefers a
+    # real structured_answer over its canned greeting reply whenever one
+    # comes back, so returning True here for a named entity is enough; no
+    # other change is needed.
     ents = plan.get("entities") or {}
     if any(ents.get(k) for k in ("tile", "slide", "hpc", "sample")):
         return True
+    if plan.get("intent") in ("general_query", "greeting", "help"):
+        return False
     if plan.get("operations"):
         return True
     if plan.get("intent") in ("analytics_query", "explain_query", "slide_query", "tile_query", "hpc_query", "sample_query"):

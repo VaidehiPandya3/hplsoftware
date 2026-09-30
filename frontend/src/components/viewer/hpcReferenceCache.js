@@ -5,7 +5,13 @@
 // only for the HPC ids actually present on the current slide, and cache
 // every result in a module-level Map so the same id is never re-fetched
 // during the session (HPC dictionary/survival rows are static reference
-// data — safe to cache for the app's lifetime).
+// data — safe to cache for as long as the Knowledge Bank does not change).
+//
+// That caveat is load-bearing: the cache is keyed by hpc id alone, and an hpc
+// id only means one thing within a single Knowledge Bank. hpl_kb and
+// hpl_kb_test have their own hpc_dictionary and hpc_survival_analysis rows, so
+// switching target has to empty this — see clearHpcReferenceCache below, and
+// app_v28.py's st.cache_data.clear() on the same switch, for the same reason.
 
 import { api } from "../../api.js";
 
@@ -113,4 +119,23 @@ export async function getHpcSurvivalMapFor(hpcIds, pThreshold = 0.05) {
     });
   }
   return map;
+}
+
+
+/**
+ * Empty every cache in this module.
+ *
+ * Called when the Knowledge Bank target changes. Without it, the viewer keeps
+ * showing the previous database's cluster titles and survival coefficients for
+ * any hpc id present in both — which is exactly the "one view reading one
+ * database while another reads the other" failure the KB selector exists to
+ * prevent, one level down. In-flight promises are dropped too: they were
+ * issued against the old target, so their results are answers to a question
+ * nobody is asking any more.
+ */
+export function clearHpcReferenceCache() {
+  infoCache.clear();
+  infoPending.clear();
+  survivalCache.clear();
+  survivalPending.clear();
 }

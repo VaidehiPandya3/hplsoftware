@@ -610,6 +610,23 @@ def _next_action(
     tiling, packaging, extraction = steps
     target = _resume_target(runs, live)
 
+    # A pipeline run (POST /pipeline-runs) drives its own Stages 1-4, and the
+    # per-stage endpoints refuse it — so "Start packaging" here would be a
+    # button that can only fail. Until its stages are done, the one thing to do
+    # is follow (or resume) the pipeline, which the run's own panel offers.
+    target_run = next((r for r in runs if r.get("submission_id") == target), None)
+    if (target_run and str(target_run.get("job_id") or "").startswith("nf:")
+            and not all(step["state"] == DONE for step in steps)):
+        stopped = any(step["state"] in (FAILED, ATTENTION) for step in steps)
+        return {
+            "kind": "wait",
+            "submission_id": target,
+            "label": "Pipeline stopped — resume it from the run below" if stopped
+                     else "Nextflow pipeline in progress",
+            "detail": "Stages 1-4 run as one Nextflow pipeline; each stage is "
+                      "verified before the next starts.",
+        }
+
     if not runs:
         return {
             "kind": "submit",

@@ -91,7 +91,14 @@ def test_slide_handles_are_keyed_by_target(_tmp=None):
 def test_the_wsi_map_and_heatmap_are_per_target(_tmp=None):
     import tile_server_v2_ as srv
     assert isinstance(srv._wsi_maps, dict)
-    assert isinstance(srv._heatmap_probs, dict)
+    # The heatmap cache now holds each target's p_hpc_* column names rather than
+    # the whole 149 MB table — the probabilities are read per slide, by key (see
+    # test_heatmap_probs.py). Still keyed by target, which is what matters here:
+    # merging production's probabilities into a test cohort's tiles would put
+    # plausible numbers on tiles they were never computed for.
+    assert isinstance(srv._heatmap_columns_cache, dict)
+    assert not hasattr(srv, "_heatmap_probs"), (
+        "the whole-table heatmap cache is back")
     # and there is no surviving single-database global to fall back to
     assert not hasattr(srv, "_wsi_map"), "the old process-wide _wsi_map is back"
 
@@ -204,6 +211,124 @@ def test_switching_target_clears_the_image_cache(_tmp=None):
     assert "self.cache.clear()" in body, (
         "switching target keeps images cached by slide_id, which means test "
         "can show production's tiles")
+
+
+# --- URLs the browser fetches for itself ----------------------------------
+#
+# Every other call in this file is made by a Python process: the client attaches
+# kb_target and the test above proves the endpoint reads it. OpenSeadragon is
+# the exception — it is handed a URL and does its own fetching, from the user's
+# browser, so it sends exactly what is in that string and nothing the client
+# holds. A viewer that 404s on every test-KB slide while the surrounding page
+# reads test correctly is this gap, not the endpoint's.
+
+#: OpenSeadragon 4.1.1's own rule, from DziTileSource.configure: it copies the
+#: query onto every tile URL it derives, but only when the query follows a
+#: .dzi/.xml/.js extension. A target passed any other way reaches the metadata
+#: and none of the tiles.
+_OSD_FORWARDS_QUERY = re.compile(r"\.(dzi|xml|js)\?")
+
+
+def _viewer_source() -> str:
+    source = APP.read_text()
+    start = source.index("def render_openseadragon_viewer")
+    return source[start:source.index("\ndef ", start)]
+
+
+def test_the_viewers_dzi_url_carries_the_target(_tmp=None):
+    """Without it the metadata request resolves against production's
+    wsi_registry, and a cohort registered only in test cannot open at all."""
+    viewer = _viewer_source()
+    assert "kb_target=" in viewer and "client.kb_target" in viewer, (
+        "the DZI URL does not carry the selected Knowledge Bank")
+
+
+def _rendered_dzi_url() -> str:
+    """The f-string with its placeholders emptied — what the URL looks like to
+    a regex, without executing a Streamlit module to find out."""
+    line = [l for l in _viewer_source().splitlines() if "dzi_url = " in l][0]
+    return re.sub(r"\{[^}]*\}", "", line)
+
+
+def test_the_dzi_query_sits_where_openseadragon_will_forward_it(_tmp=None):
+    """Position, not just presence: the tiles inherit the query only when it
+    follows the .dzi extension. 996 tiles 404ing against production while the
+    metadata came from test is the failure this pins."""
+    assert _OSD_FORWARDS_QUERY.search(_rendered_dzi_url()), (
+        f"OpenSeadragon will not carry the target to the tile requests: "
+        f"{_rendered_dzi_url()}")
+
+
+def test_openseadragons_rule_is_what_this_relies_on(_tmp=None):
+    """The rule itself, so the reason survives an upgrade: if a future version
+    stops forwarding the query, this is the assumption that broke."""
+    assert _OSD_FORWARDS_QUERY.search("http://h:8000/dzi/SLIDE.dzi?kb_target=test")
+    assert not _OSD_FORWARDS_QUERY.search("http://h:8000/dzi/SLIDE.dzi")
+    assert not _OSD_FORWARDS_QUERY.search("http://h:8000/dzi/SLIDE_files/9/1_2.jpeg")
+
+
+def test_the_slide_id_is_encoded_into_that_url(_tmp=None):
+    """Ours carry spaces and colons — "BB232000 A1 -1 - 2023-08-29 20.07.22"."""
+    assert "quote(slide_id" in _viewer_source()
+
+
+def test_the_viewer_uses_the_browsers_address_for_the_server(_tmp=None):
+    """Server-side calls and the viewer's own reach the same server at
+    different addresses whenever Streamlit runs behind an SSH tunnel, and only
+    the viewer's is the browser's."""
+    source = APP.read_text()
+    assert 'TILE_SERVER_BROWSER_URL = os.getenv("TILE_SERVER_BROWSER_URL", TILE_SERVER_URL)' in source, (
+        "no browser-facing base URL, or it no longer defaults to TILE_SERVER_URL")
+    assert "TILE_SERVER_BROWSER_URL}/dzi/" in _viewer_source()
+
+
+def test_the_svs_fallback_sends_the_target(_tmp=None):
+    """The one call in app_v28 that builds its own request rather than going
+    through TileServerClient, so the one the client cannot cover."""
+    source = APP.read_text()
+    start = source.index("def fetch_tile_region_from_svs")
+    body = source[start:source.index("\ndef ", start)]
+    assert '"kb_target": client.kb_target' in body
+
+
+def test_the_react_client_puts_it_on_the_dzi_url_too(_tmp=None):
+    """The React UI merges kb_target into get() and post() the same way, and
+    hand-builds this one URL the same way — so it has the same gap."""
+    api = (BACKEND.parent / "frontend" / "src" / "api.js").read_text()
+    start = api.index("dziUrl:")
+    line = api[start:api.index("\n", api.index("BASE_URL", start))]
+    assert "kb_target=" in line, "the React DZI URL does not carry the target"
+    assert ".dzi?kb_target=" in line.replace(" ", ""), (
+        "the query is not where OpenSeadragon will forward it to the tiles")
+    assert "encodeURIComponent(slideId)" in line
+
+
+# --- and the server opens the slide from the request's own target ----------
+
+_SLIDE_OPENERS = re.compile(r"(?<!def )\b(_open_slide|_get_deepzoom)\(([^)]*)\)")
+
+
+def _openers_missing_a_target(source: str) -> list:
+    return [f"{name}({args})" for name, args in _SLIDE_OPENERS.findall(source)
+            if "," not in args]
+
+
+def test_every_slide_endpoint_opens_its_slide_from_the_request_target(_tmp=None):
+    """A default argument is how this one gets missed: the call compiles, the
+    endpoint declares kb_target, and the slide is resolved against production
+    anyway. /slide/{id}/region did exactly that until 2026-09-15."""
+    missing = _openers_missing_a_target(SERVER_SOURCE)
+    assert not missing, f"these open a slide from production regardless: {missing}"
+
+
+def test_that_check_can_fail(_tmp=None):
+    """The bug reduced — and the definitions, which legitimately name one
+    parameter and a default, must not be read as call sites."""
+    assert _openers_missing_a_target("    slide = _open_slide(slide_id)") == [
+        "_open_slide(slide_id)"]
+    assert _openers_missing_a_target("    slide = _open_slide(slide_id, kb_target)") == []
+    assert _openers_missing_a_target(
+        "def _open_slide(slide_id: str, kb_target: str = KB_PRODUCTION):") == []
 
 
 # --- the Streamlit app ----------------------------------------------------

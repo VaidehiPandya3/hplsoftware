@@ -21,6 +21,24 @@ from PIL import Image
 from local_cache import LocalImageCache
 
 
+#: Read timeout for the four Knowledge Bank endpoints, which run their whole
+#: job in-process inside the request rather than handing it to Slurm. On a real
+#: cohort that is minutes to hours: registration opens the packaged .h5, reads a
+#: per-slide metadata CSV for every slide, and queries the KB for collisions,
+#: and with "Also read slide headers" ticked it opens every slide file as well.
+#: The 30s default turned that into a read timeout that looks like a failure
+#: while the server is still working — and, worse, on /register and /kb-load the
+#: work carries on and commits after the client has given up, so the UI reports
+#: an error over rows that are now in the KB. A day is a deliberate ceiling
+#: rather than an estimate: nothing here should come close, and the cost of
+#: setting it too low is a false failure on a real write, while the cost of
+#: setting it too high is only that a genuinely wedged request has to be killed
+#: by restarting the client. Note requests treats this as a *read* timeout —
+#: time waiting for bytes, not total duration — and these endpoints send nothing
+#: until they finish, so for them the two are the same thing.
+KB_REQUEST_TIMEOUT = 24 * 60 * 60
+
+
 class TileServerClient:
     #: Knowledge Bank the server should read and write. "production" is hpl_kb,
     #: "test" is hpl_kb_test.
@@ -211,6 +229,109 @@ class TileServerClient:
         if tiling_params:
             body["tiling_params"] = tiling_params
         return self._post_json("/dataset-jobs", body)
+
+    def get_pipeline_defaults(self) -> dict:
+        """The settings a one-click run uses — all the server's own."""
+        return self._get_json("/pipeline-defaults")
+
+    def start_pipeline_run(
+        self,
+        dataset_path: str,
+        checkpoint: str | None = None,
+        *,
+        dataset_name: str | None = None,
+        max_concurrent: int | None = None,
+        min_tissue: float | None = None,
+        sample_size: int | None = None,
+        slide_names: list[str] | None = None,
+        seed: int | None = None,
+        partition: str | None = None,
+        notify_email: str | None = None,
+        model: str = "BarlowTwins_3",
+        extraction_shards: int = 1,
+        reference: str | None = None,
+        vote_preset: str | None = None,
+        vote_overrides: dict | None = None,
+        assignment_shards: int = 1,
+        device: str = "auto",
+        chain: int | None = None,
+        time_limit: str | None = None,
+        allow_incomplete: bool = False,
+        move_existing_outputs: bool = True,
+    ) -> dict:
+        """One click: Stages 1-4 as a single Nextflow run (POST /pipeline-runs).
+
+        Every input a later stage used to ask for at its own button is sent
+        here, once, and the server refuses before queueing anything if one is
+        wrong — a checkpoint typo is a 400 now, not a failed GPU task after
+        hours of tiling. Returns a submission_id polled through
+        get_dataset_job_status like any run; its `pipeline` block says where
+        each stage is. Registration and the KB load stay manual.
+        """
+        body = {
+            "dataset_path": dataset_path,
+            "dataset_name": dataset_name,
+            "max_concurrent": max_concurrent,
+            "sample_size": sample_size,
+            "slide_names": slide_names,
+            "seed": seed,
+            "partition": partition,
+            "notify_email": notify_email,
+            "checkpoint": checkpoint,
+            "model": model,
+            "extraction_shards": extraction_shards,
+            "reference": reference,
+            "assignment_shards": assignment_shards,
+            "device": device,
+            "chain": chain,
+            "time_limit": time_limit,
+            "allow_incomplete": allow_incomplete,
+            "move_existing_outputs": move_existing_outputs,
+        }
+        if min_tissue is not None:
+            body["min_tissue"] = min_tissue
+        if vote_preset:
+            body["vote_preset"] = vote_preset
+        body.update({k: v for k, v in (vote_overrides or {}).items() if v is not None})
+        # Unset means "the server's default": dropped rather than sent as null,
+        # so a one-click call carries only the path.
+        body = {k: v for k, v in body.items() if v is not None}
+        return self._post_json("/pipeline-runs", body)
+
+    def start_anorak_run(self, dataset_path: str, *, slides_csv: str | None = None,
+                         sample_size: int | None = None, seed: int | None = None) -> dict:
+        """One click: ANORAK on its own over a dataset path (POST /anorak-runs).
+
+        Without slides_csv every slide in the directory is graded, grouped into
+        tumours by HPL's slide-id rule, and recorded as tumour-unverified. With
+        one (select_tumour_slides.py's output) it is checked as Stage 7 checks
+        it. sample_size makes it a test run on a random, seeded subset.
+        """
+        body = {"dataset_path": dataset_path, "slides_csv": slides_csv,
+                "sample_size": sample_size, "seed": seed}
+        return self._post_json("/anorak-runs", {k: v for k, v in body.items() if v is not None},
+                               timeout=300)
+
+    def resume_anorak_run(self, submission_id: str) -> dict:
+        """Resubmit a stopped ANORAK run exactly as it was, with -resume."""
+        return self._post_json(f"/dataset-jobs/{submission_id}/anorak-resume", {}, timeout=300)
+
+    def resume_pipeline_run(self, submission_id: str, chain: int | None = None,
+                            time_limit: str | None = None,
+                            allow_incomplete: bool | None = None) -> dict:
+        """Resubmit a stopped pipeline run with -resume: re-runs only what did
+        not finish, with the run's own recorded settings."""
+        return self._post_json(
+            f"/dataset-jobs/{submission_id}/pipeline-resume",
+            {"chain": chain, "time_limit": time_limit,
+             "allow_incomplete": allow_incomplete},
+        )
+
+    def check_pipeline_submit(self, partition: str | None = None) -> dict:
+        """Can a compute node run sbatch? The head job submits every task."""
+        return self._get_json("/pipeline-submit-check",
+                              params={"partition": partition} if partition else None,
+                              timeout=180)
 
     def list_dataset_jobs(self, with_state: bool = False) -> list[dict]:
         """Recent dataset runs, newest first.
@@ -419,6 +540,66 @@ class TileServerClient:
             f"/dataset-jobs/{submission_id}/assign-clusters", body,
         )
 
+    def start_anorak(
+        self,
+        submission_id: str,
+        slides_csv: str,
+        scope: str = "full",
+        sample_size: int | None = None,
+        seed: int | None = None,
+        resume: bool = True,
+        overwrite: bool = False,
+        time_limit: str | None = None,
+        chain: int = 2,
+    ) -> dict:
+        """User-triggered: run the ANORAK Nextflow pipeline over a slide list.
+
+        scope="subset" samples `sample_size` slides at random rather than
+        taking the first N — the first N of a cohort sorted by slide id is
+        usually one or two patients, sharing a scanner, a batch and a stain
+        run, which is the least informative way to spend a test. A seed is
+        recorded whether or not one is given, so the sample can be asked for
+        again and a later disagreement has something to point at.
+
+        resume continues the run's cached Nextflow work directory, which is
+        what makes a resubmission after a fixed container re-run only what
+        failed.
+
+        overwrite only permits replacing a run that already has a valid
+        grading table. The server refuses while the previous head job is in
+        flight, or while Slurm cannot say whether it is, whatever this is set
+        to — so a caller cannot opt out of that check, and should not try.
+
+        chain is the number of head jobs: the first plus chain-1 standbys that
+        resume it if it reaches its walltime or runs out of watchdog restarts.
+        2 by default here, where the server's own default is 1 for old clients.
+        """
+        return self._post_json(
+            f"/dataset-jobs/{submission_id}/anorak",
+            {
+                "slides_csv": slides_csv,
+                "scope": scope,
+                "sample_size": sample_size,
+                "seed": seed,
+                "resume": resume,
+                "overwrite": overwrite,
+                "time_limit": time_limit,
+                "chain": chain,
+            },
+        )
+
+    def check_anorak_submit(self, partition: str | None = None) -> dict:
+        """Whether a compute node can reach the Slurm controller.
+
+        Worth once per cluster before the first ANORAK run: the Nextflow head
+        job submits every task itself, and on a cluster where compute nodes
+        cannot submit it waits out its time limit having done nothing.
+        """
+        return self._get_json(
+            "/anorak-submit-check",
+            params={"partition": partition} if partition else None,
+        )
+
     def start_test_cluster_assignment(
         self,
         submission_id: str,
@@ -479,6 +660,7 @@ class TileServerClient:
             f"/dataset-jobs/{submission_id}/kb-load-preview",
             {"min_margin": min_margin, "csv_path": csv_path,
              "kb_target": self.kb_target},
+            timeout=KB_REQUEST_TIMEOUT,
         )
 
     def commit_kb_load(
@@ -508,10 +690,12 @@ class TileServerClient:
                 "min_margin": min_margin,
                 "kb_target": self.kb_target,
             },
+            timeout=KB_REQUEST_TIMEOUT,
         )
 
     def preview_registration(self, submission_id: str,
                          dataset_id: str | None = None,
+                         tile_dataset_name: str | None = None,
                          dataset_name: str | None = None,
                          raw_dir: str | None = None,
                          tile_dir: str | None = None,
@@ -531,12 +715,16 @@ class TileServerClient:
         tile_coordinates and tile_registry from what Stages 1–2 wrote to disk.
 
         Every path it needs is already on the run record, so nothing but the
-        cohort key is passed: dataset_id defaults to the run's own
-        dataset_name, upper-cased."""
+        cohort key and the tile folder is passed: dataset_id defaults to the
+        run's own dataset_name, upper-cased, and tile_dataset_name to the
+        recorded dataset_name itself — which a run predating that column, or one
+        tiled by hand, does not have, so the UI asks for it outright rather than
+        letting registration refuse."""
         return self._post_json(
             f"/dataset-jobs/{submission_id}/register-preview",
             {
             "dataset_id": dataset_id,
+            "tile_dataset_name": tile_dataset_name,
             "kb_target": self.kb_target,
             # None means "take it from the run record", which is what every run
             # driven through this UI holds. Supplied only for runs predating a
@@ -551,10 +739,12 @@ class TileServerClient:
             "write_dataset_config": write_dataset_config,
             "replace": replace,
             },
+            timeout=KB_REQUEST_TIMEOUT,
         )
 
     def commit_registration(self, submission_id: str,
                         dataset_id: str | None = None,
+                        tile_dataset_name: str | None = None,
                         dataset_name: str | None = None,
                         raw_dir: str | None = None,
                         tile_dir: str | None = None,
@@ -577,6 +767,11 @@ class TileServerClient:
             f"/dataset-jobs/{submission_id}/register",
             {
             "dataset_id": dataset_id,
+            # The tile folder Stage 1 wrote into. Sent on both calls because
+            # the two have to read the same folder — a preview against one and
+            # a commit against another would report numbers from a cohort it
+            # did not write.
+            "tile_dataset_name": tile_dataset_name,
             "kb_target": self.kb_target,
             # None means "take it from the run record", which is what every run
             # driven through this UI holds. Supplied only for runs predating a
@@ -595,8 +790,80 @@ class TileServerClient:
             "write_dataset_config": write_dataset_config,
             "replace": replace,
             },
+            timeout=KB_REQUEST_TIMEOUT,
         )
 
+
+    def submit_registration(self, submission_id: str,
+                            dataset_id: str | None = None,
+                            tile_dataset_name: str | None = None,
+                            raw_dir: str | None = None,
+                            tile_dir: str | None = None,
+                            h5_path: str | None = None,
+                            scope: str = "full",
+                            slide_names: list[str] | None = None,
+                            slide_metadata: bool = False,
+                            write_dataset_config: bool = True,
+                            replace: bool = False) -> dict:
+        """Queue Stage 5 on Slurm instead of writing inside the request.
+
+        Returns as soon as sbatch has taken the job, so the write outlives this
+        client and the server both. Poll get_dataset_job_status() for
+        registration_slurm_state and registration_done — the job sets done
+        itself, so it still means committed.
+
+        Same arguments as commit_registration, and the job runs the same
+        functions with the same guards; the difference is only where."""
+        return self._post_json(
+            f"/dataset-jobs/{submission_id}/register-submit",
+            {
+                "dataset_id": dataset_id,
+                "tile_dataset_name": tile_dataset_name,
+                "kb_target": self.kb_target,
+                # The same overrides as the in-server path; the server resolves
+                # both through one function, so they read the same files.
+                "raw_dir": raw_dir,
+                "tile_dir": tile_dir,
+                "h5_path": h5_path,
+                "scope": scope,
+                "slide_names": slide_names,
+                "slide_metadata": slide_metadata,
+                "write_dataset_config": write_dataset_config,
+                "replace": replace,
+            },
+        )
+
+    def submit_kb_load(self, submission_id: str,
+                       cancer_type: str | None = None,
+                       allow_unknown_clusters: bool = False,
+                       skip_profiles: bool = False,
+                       min_margin: float = 0.0,
+                       csv_path: str | None = None) -> dict:
+        """Queue Stage 6 on Slurm. See submit_registration."""
+        return self._post_json(
+            f"/dataset-jobs/{submission_id}/kb-load-submit",
+            {
+                "cancer_type": cancer_type,
+                "allow_unknown_clusters": allow_unknown_clusters,
+                "skip_profiles": skip_profiles,
+                "csv_path": csv_path,
+                "min_margin": min_margin,
+                "kb_target": self.kb_target,
+            },
+        )
+
+    def check_kb_job_db(self) -> dict:
+        """Can a compute node reach *and use* Postgres? Queues a one-second srun,
+        so it is slow — minutes if the queue is busy — and is only worth calling
+        when a Slurm-backed KB write has been refused or has failed to connect.
+
+        Read "usable", not "reachable": the socket opening proves only that
+        something is listening, and a job that connects and then fails
+        authentication has already cost the queue time this call exists to save.
+        Probes whichever Knowledge Bank this client is pointed at, since the test
+        database not existing on that host is one of the answers."""
+        return self._get_json("/kb-job-db-check",
+                              params={"kb_target": self.kb_target}, timeout=300)
 
     def start_test_packaging(
         self,

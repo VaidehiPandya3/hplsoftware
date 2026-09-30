@@ -7,9 +7,9 @@ import { errorDetail, httpDetail, SLURM_IN_FLIGHT } from "../utils";
 import { Alert, Button, CodeBlock, Expander, Field, Metric, RadioGroup } from "../widgets";
 
 const SHIFT_STYLE = {
-  consistent: { icon: "✅", type: "success" },
-  notice: { icon: "⚠️", type: "warning" },
-  alarm: { icon: "🛑", type: "error" },
+  consistent: { icon: "", type: "success" },
+  notice: { icon: "", type: "warning" },
+  alarm: { icon: "", type: "error" },
 };
 
 // "Is this cohort represented in the reference?" — a distinct question from
@@ -177,7 +177,7 @@ function CohortShift({ submissionId }) {
 // inputs, because a half-applied configuration (distance weighting on but
 // the exponent left at 1, say) produces a complete CSV that isn't the
 // measured configuration.
-function VotePicker({ submissionId, onChange }) {
+export function VotePicker({ submissionId, onChange }) {
   const [presets, setPresets] = useState(null);
   const [loadError, setLoadError] = useState(null);
   const [chosen, setChosen] = useState("");

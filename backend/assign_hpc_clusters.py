@@ -43,6 +43,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -163,6 +165,22 @@ def iter_embedding_chunks(h5_path: Path, rep_key: str, chunk: int,
             yield start, stop, np.asarray(dataset[start:stop], dtype=np.float32)
 
 
+def read_embedding_range(h5_path: Path, rep_key: str, start: int,
+                         stop: int) -> np.ndarray:
+    """One [start, stop) slice of the embeddings.
+
+    A single range rather than a generator, because with chunk-level
+    checkpointing the loop decides which ranges it needs — a resumed shard must
+    not read the chunks it is skipping. Same resolution of rep_key as
+    iter_embedding_chunks, which is still what the mean pass uses.
+    """
+    with h5py.File(h5_path, "r") as content:
+        rep_name, _ = _resolve_datasets(content, rep_key)
+        dataset = content[rep_name]
+        stop = min(stop, dataset.shape[0])
+        return np.asarray(dataset[start:stop], dtype=np.float32)
+
+
 def compute_query_mean(h5_path: Path, rep_key: str, chunk: int,
                        total_rows: int) -> np.ndarray:
     """Mean over *every* query row, accumulated in float64.
@@ -257,6 +275,151 @@ def project(embeddings: np.ndarray, components: np.ndarray,
 _COSINE_EPS = 1e-12  # guards a zero-norm vector, which cosine has no direction for
 
 
+def _gpu_unavailable_reason(faiss) -> str | None:
+    """Why this build cannot search on a GPU, or None if it can try.
+
+    Deliberately not a verification — that happens in Searcher, by searching
+    with both indexes and comparing. This only answers "is there any point
+    trying", which is what "auto" needs and what a capability flag can honestly
+    report. A build can pass every check here and still be a stub.
+    """
+    if not hasattr(faiss, "StandardGpuResources"):
+        return ("this faiss build has no GPU support (no StandardGpuResources); "
+                "install the GPU extras with "
+                "`submit_feature_extraction.py --bootstrap-extras-gpu`")
+    try:
+        if faiss.get_num_gpus() < 1:
+            return "faiss reports no GPU devices visible to this process"
+    except Exception as e:  # noqa: BLE001
+        return f"faiss could not count GPUs ({type(e).__name__})"
+    return None
+
+
+def _chunk_identity(*, reference: Path, rep_key: str, centering: str,
+                    query_mean: Path | None, chunk_size: int, lo: int, hi: int,
+                    vote: dict) -> dict:
+    """Everything that would change a label, for the resume manifest.
+
+    A resume that differs on any of these is not a resume, it is two different
+    computations concatenated — a complete CSV in which some rows came from one
+    configuration and some from another, with nothing to say so. Refused rather
+    than reconciled.
+
+    Device is deliberately NOT in here. GPU and CPU agree on 100% of nearest
+    neighbours and ~99.99% of the k-list, differing only by reordering inside
+    near-ties, which changes a vote only where it was already tied. So resuming
+    a preempted GPU shard on a CPU is allowed — that is the whole point — and
+    the manifest records which devices contributed instead.
+    """
+    return {
+        "reference": os.path.realpath(reference),
+        "rep_key": rep_key,
+        "centering": centering,
+        "query_mean": os.path.realpath(query_mean) if query_mean else None,
+        "chunk_size": int(chunk_size),
+        "row_start": int(lo),
+        "row_stop": int(hi),
+        "vote": vote,
+    }
+
+
+def _read_manifest(chunk_dir: Path) -> dict | None:
+    path = chunk_dir / "manifest.json"
+    if not path.is_file():
+        return None
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def _chunk_path(chunk_dir: Path, start: int, stop: int) -> Path:
+    return chunk_dir / f"chunk_{start:012d}-{stop:012d}.csv"
+
+
+def _complete_chunk_rows(path: Path) -> int | None:
+    """Rows in a finished chunk file, or None if it does not look finished.
+
+    Counted rather than trusted. A chunk file only exists if it was renamed
+    into place whole, but a filesystem that reordered the rename against the
+    data, or a hand-edited directory, would otherwise hand a short chunk
+    straight into the assembled output.
+    """
+    if not path.is_file():
+        return None
+    try:
+        with path.open("rb") as fh:
+            lines = sum(1 for _ in fh)
+    except OSError:
+        return None
+    return max(lines - 1, 0)          # minus the header
+
+
+def resolve_thread_count(requested: int | None, allowed: int) -> int:
+    """How many threads to actually run, given what was asked for and what the
+    process is allowed to use.
+
+    Never more than the CPUs in the affinity mask. Asking for more is not
+    merely wasted — it is slower than running single-threaded, because the
+    threads take turns on the cores they do have and pay a context switch each
+    time. Measured on this pipeline: an assignment told to use 16 threads on a
+    node that gave it fewer usable CPUs ran at 20 tiles/s, against 49 tiles/s
+    for the same work on one thread.
+
+    That is why the environment variable alone was never enough.
+    OMP_NUM_THREADS says what Slurm allocated; sched_getaffinity says what this
+    process may touch, and only the second one is binding.
+    """
+    if not allowed or allowed < 1:
+        allowed = 1
+    if not requested or requested < 1:
+        return allowed
+    return max(1, min(requested, allowed))
+
+
+def _configure_threads() -> int:
+    """Pin faiss's thread pool to the cores this process can really use, and
+    say so in the log.
+
+    Printed unconditionally because the number is invisible otherwise: a job
+    running 16 threads on one core and a job running one thread look identical
+    from outside, and differ by 2.4x in throughput.
+    """
+    try:
+        allowed = len(os.sched_getaffinity(0))
+    except AttributeError:                      # not Linux
+        allowed = os.cpu_count() or 1
+    try:
+        requested = int(os.environ.get("OMP_NUM_THREADS", "") or 0)
+    except ValueError:
+        requested = 0
+
+    threads = resolve_thread_count(requested, allowed)
+    note = ""
+    try:
+        import faiss
+        faiss.omp_set_num_threads(threads)
+        actual = faiss.omp_get_max_threads()
+        if actual != threads:
+            note = (f"  [faiss reports {actual} — this build may ignore the "
+                    f"thread count]")
+    except Exception as e:                       # noqa: BLE001
+        note = f"  [could not set faiss threads: {type(e).__name__}]"
+
+    print(f"Threads   : {threads} "
+          f"(OMP_NUM_THREADS={requested or 'unset'}, "
+          f"{allowed} CPU(s) usable by this process){note}")
+    if requested and requested > allowed:
+        print(f"  NOTE: asked for {requested} threads but only {allowed} CPU(s) "
+              f"are in this process's affinity mask, which is slower than "
+              f"running single-threaded. Capped to {threads}. The sbatch asked "
+              f"Slurm for more cores than the task can reach — check "
+              f"--cpus-per-task against the site's CPU binding, or shard "
+              f"instead, which gives each process its own allocation.",
+          file=sys.stderr)
+    return threads
+
+
 class Searcher:
     """Exact k-NN search over the reference via a faiss flat index.
 
@@ -274,10 +437,15 @@ class Searcher:
     this is a different metric on the same flat index, not an approximation.
     """
 
-    def __init__(self, reference: np.ndarray, metric: str = "l2"):
+    def __init__(self, reference: np.ndarray, metric: str = "l2",
+                 device: str = "auto"):
         if metric not in ("l2", "cosine"):
             raise ValueError(f"Unknown metric: {metric!r}. Use 'l2' or 'cosine'.")
+        if device not in ("cpu", "gpu", "auto"):
+            raise ValueError(
+                f"Unknown device: {device!r}. Use 'auto', 'cpu' or 'gpu'.")
         self.metric = metric
+        self.device = device
         self.reference = np.ascontiguousarray(reference, dtype=np.float32)
         try:
             import faiss
@@ -294,8 +462,113 @@ class Searcher:
         else:
             index = faiss.IndexFlatL2(self.reference.shape[1])
             index.add(self.reference)
-        self.index = index
+
         self.backend = "faiss-flat" if metric == "l2" else "faiss-flat-cosine"
+
+        # "auto" is the default: use the GPU when there is a working one, and
+        # the CPU otherwise. The fallback is announced rather than silent — the
+        # Backend line below always says which ran — because a GPU quietly
+        # becoming a CPU is a 30x slowdown that looks like nothing at all.
+        #
+        # What "auto" never does is lower the bar on correctness. A GPU index
+        # that disagrees with the CPU index is refused in every mode, not fallen
+        # back from: disagreement means the build is broken, and a broken build
+        # would produce a complete CSV of wrong cluster IDs whichever flag asked
+        # for it.
+        if device == "auto":
+            reason = _gpu_unavailable_reason(faiss)
+            if reason:
+                self.device = "cpu"
+                self._auto_note = reason
+                device = "cpu"
+            else:
+                device = "gpu"
+                self.device = "gpu"
+
+        if device == "gpu":
+            # Still the same exhaustive scan — GpuIndexFlat compares every query
+            # against every reference vector, exactly as IndexFlat does. That is
+            # what makes this admissible where faiss-ivf was not: ivf changed
+            # which neighbour came back (33% agreement), and this changes only
+            # the hardware doing the arithmetic.
+            #
+            # Refused rather than quietly falling back to CPU. A silent fallback
+            # here is a ~30x slowdown that shows up as nothing but wall clock,
+            # which is the same class of bug as the --cleanenv thread count.
+            if not hasattr(faiss, "StandardGpuResources"):
+                raise SystemExit(
+                    "--device gpu needs a faiss build with GPU support, and this "
+                    "one has none (faiss.StandardGpuResources is missing). The "
+                    "container's extras hold faiss-cpu; install the GPU extras "
+                    "with `python submit_feature_extraction.py "
+                    "--bootstrap-extras-gpu` and submit with --device gpu, or "
+                    "drop the flag to search on CPU."
+                )
+            try:
+                self._gpu_resources = faiss.StandardGpuResources()
+                gpu_index = faiss.index_cpu_to_gpu(self._gpu_resources, 0, index)
+            except Exception as e:  # noqa: BLE001 — surfaced, never downgraded
+                raise SystemExit(
+                    f"--device gpu was asked for and the index could not be "
+                    f"moved to GPU 0: {type(e).__name__}: {e}. Refusing rather "
+                    f"than searching on CPU at a thirtieth of the speed without "
+                    f"saying so."
+                ) from e
+            self._verify_matches_cpu(index, gpu_index)
+            index = gpu_index
+            self.backend += "-gpu"
+        self.index = index
+
+    def _verify_matches_cpu(self, cpu_index, gpu_index, sample: int = 2048) -> None:
+        """Refuse a GPU index that does not agree with the CPU one.
+
+        Not defensive programming — a measured necessity. A faiss build can
+        expose StandardGpuResources, accept index_cpu_to_gpu without error, and
+        then return entirely different neighbours: on faiss 1.15.0 with
+        get_num_gpus() reporting 1 and no usable device, this returned the right
+        *shape* of answer with 18% of the top-1 neighbours correct and distances
+        wrong by three orders of magnitude.
+
+        Nothing downstream could catch that. Every tile would get a cluster ID,
+        every margin would look plausible, the CSV would have no missing values,
+        and the labels would be noise. So the capability is tested by doing the
+        search rather than by asking whether it is available — one second on a
+        sample of the reference, against the CPU index that is already built.
+
+        Queries are reference rows, which makes the answer checkable on its own
+        terms as well: a vector's nearest neighbour is itself, at distance zero.
+        """
+        rows = min(sample, self.reference.shape[0])
+        if not rows:
+            return
+        probe = self.reference[:rows]
+        if self.metric == "cosine":
+            probe = self._normalize(probe)
+        k = min(10, self.reference.shape[0])
+
+        cpu_distances, cpu_indices = cpu_index.search(probe, k)
+        gpu_distances, gpu_indices = gpu_index.search(probe, k)
+
+        top1 = float((cpu_indices[:, 0] == gpu_indices[:, 0]).mean())
+        # Absolute tolerance rather than relative: these are squared distances
+        # whose scale is set by the embedding, and float32 accumulation order
+        # differs legitimately between the two implementations.
+        worst = float(np.abs(cpu_distances - gpu_distances).max())
+        scale = max(float(np.abs(cpu_distances).max()), 1.0)
+
+        if top1 < 0.999 or worst > 1e-2 * scale:
+            raise SystemExit(
+                f"REFUSING --device gpu: the GPU index disagrees with the CPU "
+                f"index on this machine. Of {rows:,} reference vectors searched "
+                f"against the index they came from, {top1 * 100:.1f}% returned "
+                f"themselves as the nearest neighbour (must be ~100%), and the "
+                f"largest distance difference was {worst:.3g} against a scale of "
+                f"{scale:.3g}.\n\n"
+                f"This is a broken or stub GPU faiss build, not a precision "
+                f"difference. Every cluster ID it produced would be wrong while "
+                f"looking entirely well-formed. Search on CPU (--device cpu) "
+                f"until the container's GPU faiss is fixed."
+            )
 
     @staticmethod
     def _normalize(vectors: np.ndarray) -> np.ndarray:
@@ -620,8 +893,12 @@ def assign(args) -> dict:
     with h5py.File(args.h5, "r") as content:
         _, meta_keys = _resolve_datasets(content, args.rep_key)
 
-    searcher = Searcher(reference, metric=args.metric)
+    searcher = Searcher(reference, metric=args.metric, device=args.device)
     print(f"Backend   : {searcher.backend}, centering={args.centering}")
+    if getattr(searcher, "_auto_note", None):
+        print(f"            (--device auto fell back to CPU: "
+              f"{searcher._auto_note})")
+    _configure_threads()
 
     # A property of the reference, so computed once here rather than per chunk.
     local_scale = None
@@ -654,19 +931,96 @@ def assign(args) -> dict:
     if tmp_path.exists():
         tmp_path.unlink()
 
+    # Chunk-level checkpointing, so a preempted or requeued task resumes where
+    # it stopped instead of restarting its whole range. Each chunk is written
+    # under a .tmp name and renamed, so a chunk file exists only if it is
+    # whole; the assembled output is still only renamed into place at the very
+    # end. Always on rather than a flag, because a requeued job re-runs the
+    # identical command line — a resume that needed remembering would never
+    # happen on the attempt that needed it.
+    chunk_dir = out_path.with_name(out_path.name + ".chunks")
+    identity = _chunk_identity(
+        reference=args.reference, rep_key=args.rep_key, centering=args.centering,
+        query_mean=args.query_mean, chunk_size=args.chunk_size, lo=lo, hi=hi,
+        vote={"k": k, "k_search": k_search,
+              "distance_weighted": bool(args.distance_weighted),
+              "distance_power": float(args.distance_power),
+              "class_weighted": bool(args.class_weighted),
+              "local_scaling": int(args.local_scaling),
+              "adaptive_margin": float(adaptive_margin),
+              "adaptive_k": int(adaptive_k)},
+    )
+    existing = _read_manifest(chunk_dir)
+    if existing is not None and existing.get("identity") != identity:
+        differing = sorted(
+            key for key in identity
+            if (existing.get("identity") or {}).get(key) != identity[key])
+        raise SystemExit(
+            f"{chunk_dir} holds chunks from a different configuration "
+            f"(differs on: {', '.join(differing)}). Resuming across that would "
+            f"concatenate two computations into one CSV, with some rows from "
+            f"each and nothing to say which. Delete the directory to start this "
+            f"range again:\n\n    rm -rf {chunk_dir}"
+        )
+    chunk_dir.mkdir(parents=True, exist_ok=True)
+    if existing is None:
+        (chunk_dir / "manifest.json").write_text(
+            json.dumps({"identity": identity, "devices": [searcher.device]},
+                       indent=2, sort_keys=True))
+    elif searcher.device not in (existing.get("devices") or []):
+        # Which devices contributed. A mixed CPU/GPU shard is admissible — they
+        # agree except on near-tie ordering — but it should be recorded rather
+        # than inferred later from nothing.
+        existing.setdefault("devices", []).append(searcher.device)
+        (chunk_dir / "manifest.json").write_text(
+            json.dumps(existing, indent=2, sort_keys=True))
+
     started = time.perf_counter()
     written = 0
     n_revoted = 0
+    # Where the time actually goes. The loop is read -> project -> search ->
+    # vote -> write, strictly in sequence, so any phase that is not the search
+    # is time the cores spend idle. Guessing which one dominates is how an
+    # optimisation gets aimed at the wrong phase — this measures it, at the cost
+    # of a few perf_counter calls per chunk.
+    phase = {"read": 0.0, "project": 0.0, "search": 0.0, "vote": 0.0,
+             "write": 0.0}
     try:
-        for start, stop, block in iter_embedding_chunks(
-            args.h5, args.rep_key, args.chunk_size, lo, hi
-        ):
+        # Which ranges are already done. Computed up front so the reader can be
+        # told to skip them rather than reading and discarding — a resumed shard
+        # should not pay for the chunks it is not recomputing.
+        planned = [(start, min(start + args.chunk_size, hi))
+                   for start in range(lo, hi, args.chunk_size)]
+        done: dict[tuple[int, int], int] = {}
+        for start, stop in planned:
+            rows_present = _complete_chunk_rows(_chunk_path(chunk_dir, start, stop))
+            if rows_present == stop - start:
+                done[(start, stop)] = rows_present
+        if done:
+            resumed_rows = sum(done.values())
+            print(f"Resuming  : {len(done):,}/{len(planned):,} chunks already "
+                  f"complete ({resumed_rows:,} tiles), recomputing "
+                  f"{n_assigned - resumed_rows:,}")
+            written += resumed_rows
+
+        for start, stop in planned:
+            if (start, stop) in done:
+                continue
+            _t = time.perf_counter()
+            block = read_embedding_range(args.h5, args.rep_key, start, stop)
+            phase["read"] += time.perf_counter() - _t
+
+            _t = time.perf_counter()
             queries = project(block, components, ref["mean"], args.centering,
                               query_mean=query_mean)
+            phase["project"] += time.perf_counter() - _t
             offset = start - lo
             for bstart in range(0, len(queries), args.batch_size):
                 bstop = min(bstart + args.batch_size, len(queries))
+                _t = time.perf_counter()
                 idx, dist = searcher.search(queries[bstart:bstop], k_search)
+                phase["search"] += time.perf_counter() - _t
+                _t = time.perf_counter()
                 w, m, d = vote(idx[:, :k], dist[:, :k], codes, len(categories),
                                distance_weighted=args.distance_weighted,
                                distance_power=args.distance_power,
@@ -690,6 +1044,7 @@ def assign(args) -> dict:
                         w, m, d = w.copy(), m.copy(), d.copy()
                         w[low], m[low], d[low] = w2, m2, d2
                         n_revoted += int(low.sum())
+                phase["vote"] += time.perf_counter() - _t
                 margins[offset + bstart:offset + bstop] = m
                 distances[offset + bstart:offset + bstop] = d
                 np.add.at(cluster_counts, w, 1)
@@ -697,6 +1052,7 @@ def assign(args) -> dict:
                     chunk_winners = np.empty(len(queries), dtype=np.int64)
                 chunk_winners[bstart:bstop] = w
 
+            _t = time.perf_counter()
             frame = read_metadata_frame(args.h5, meta_keys, start, stop)
             # Vectorised label lookup, replacing a per-tile list comprehension.
             frame[groupby] = category_lookup[chunk_winners]
@@ -707,17 +1063,63 @@ def assign(args) -> dict:
             # and once the CSV is merged into tile_registry there is otherwise
             # nothing to tell assignments from two different references apart.
             frame["hpc_reference"] = args.reference.stem
-            frame.to_csv(tmp_path, mode="a", header=(written == 0), index=False)
+            # .tmp then rename, so the file exists only when it is whole —
+            # the same rule the assembled output follows, applied per chunk.
+            chunk_path = _chunk_path(chunk_dir, start, stop)
+            staging = chunk_path.with_suffix(chunk_path.suffix + ".tmp")
+            frame.to_csv(staging, index=False)
+            staging.replace(chunk_path)
+            phase["write"] += time.perf_counter() - _t
             written += len(frame)
 
             if args.progress and written % max(args.progress, 1) < len(frame):
                 rate = written / max(time.perf_counter() - started, 1e-9)
-                print(f"  {written:,}/{n_assigned:,}  {rate:,.0f} tiles/s", flush=True)
+                # The phase split on every progress line, not just at the end.
+                # A run long enough for the split to matter is a run nobody
+                # wants to wait out before learning which phase to attack —
+                # this one was three days.
+                accounted = sum(phase.values()) or 1e-9
+                split = " ".join(
+                    f"{name} {seconds / accounted * 100:.0f}%"
+                    for name, seconds in sorted(phase.items(), key=lambda kv: -kv[1])
+                    if seconds / accounted >= 0.005)
+                print(f"  {written:,}/{n_assigned:,}  {rate:,.0f} tiles/s "
+                      f"[{split}]", flush=True)
 
         if written != n_assigned:
             raise RuntimeError(f"Wrote {written} rows for a range of {n_assigned}.")
+
+        # Assemble the chunks in row order. Verified against the range rather
+        # than trusted from the parts: a missing chunk leaves no gap to notice
+        # in a CSV, which is the same reason merge_assignment_shards.py counts
+        # against the projections file instead of believing the shard files.
+        assembled = 0
+        with tmp_path.open("w", newline="") as out:
+            for index, (start, stop) in enumerate(planned):
+                chunk_path = _chunk_path(chunk_dir, start, stop)
+                rows_present = _complete_chunk_rows(chunk_path)
+                if rows_present != stop - start:
+                    raise RuntimeError(
+                        f"chunk {start}-{stop} holds "
+                        f"{rows_present if rows_present is not None else 'no'} "
+                        f"rows, expected {stop - start}. Delete {chunk_dir} and "
+                        f"run this range again.")
+                with chunk_path.open("r", newline="") as part:
+                    header = part.readline()
+                    if index == 0:
+                        out.write(header)
+                    shutil.copyfileobj(part, out)
+                assembled += rows_present
+        if assembled != n_assigned:
+            raise RuntimeError(
+                f"Assembled {assembled} rows from {len(planned)} chunks for a "
+                f"range of {n_assigned}.")
         tmp_path.replace(out_path)
+        # Only once the output is whole and in place.
+        shutil.rmtree(chunk_dir, ignore_errors=True)
     except BaseException:
+        # The .partial goes; the chunks stay. That is the difference between a
+        # preempted task losing its range and losing one chunk.
         if tmp_path.exists():
             tmp_path.unlink()
         raise
@@ -725,6 +1127,21 @@ def assign(args) -> dict:
     elapsed = time.perf_counter() - started
     print(f"Assigned  : {written:,} tiles in {elapsed:.1f}s "
           f"({written/max(elapsed, 1e-9):,.0f} tiles/s)")
+    accounted = sum(phase.values())
+    print("Time spent: " + ", ".join(
+        f"{name} {seconds:,.0f}s ({seconds / max(elapsed, 1e-9) * 100:.0f}%)"
+        for name, seconds in sorted(phase.items(), key=lambda kv: -kv[1])))
+    if elapsed - accounted > 0.05 * elapsed:
+        print(f"            unaccounted {elapsed - accounted:,.0f}s "
+              f"({(elapsed - accounted) / elapsed * 100:.0f}%)")
+    # Which phase to attack is only obvious once it is measured: search is the
+    # part faiss threads and a GPU accelerates, and everything else is
+    # sequential Python that more cores do nothing for.
+    if phase["search"] < 0.5 * accounted:
+        print("            NOTE: the search is under half the time, so more "
+              "threads or a GPU can only address the smaller part. Sharding "
+              "splits every phase, including the sequential ones.",
+              file=sys.stderr)
     if adaptive_margin > 0:
         print(f"Re-voted  : {n_revoted:,} tiles ({n_revoted / max(written, 1) * 100:.1f}%) "
               f"at k={adaptive_k}")
@@ -740,6 +1157,7 @@ def assign(args) -> dict:
         "categories": categories,
         "sharded": sharded,
         "revoted": n_revoted,
+        "resumed_chunks": len(done),
     }
 
 
@@ -855,6 +1273,16 @@ def main() -> None:
     parser.add_argument("--k", type=int, default=None,
                         help="Neighbours to poll. Defaults to the reference's own "
                              "Leiden n_neighbors, which is what ingest used.")
+    parser.add_argument("--device", default="auto",
+                        choices=["auto", "cpu", "gpu"],
+                        help="Where the exact flat search runs. GPU is the same "
+                             "exhaustive scan on faster hardware, not an "
+                             "approximation, and either way the GPU index is "
+                             "verified against a CPU one at startup and refused "
+                             "on disagreement. auto (default) uses a GPU when "
+                             "there is a working one and says so when it falls "
+                             "back; gpu refuses rather than falling back; cpu "
+                             "never tries.")
     parser.add_argument("--metric", default="l2", choices=["l2", "cosine"],
                         help="l2 (default): Euclidean distance, what ingest uses. "
                              "cosine: direction only, ignoring magnitude — validate "
@@ -966,6 +1394,27 @@ def main() -> None:
         )
 
     stats = assign(args)
+
+    if stats.get("resumed_chunks"):
+        # The in-memory margins, distances and cluster counts cover only the
+        # chunks THIS attempt computed; the rest is uninitialised np.empty,
+        # which would print confident nonsense. The assembled CSV is the whole
+        # range, so the summary comes from there instead. Only on a resumed
+        # run: a normal one pays nothing.
+        print(f"            (summary read back from {stats['out_path'].name}: "
+              f"{stats['resumed_chunks']} chunk(s) came from an earlier attempt)")
+        finished = pd.read_csv(
+            stats["out_path"],
+            usecols=["vote_margin", "neighbor_distance", stats["groupby"]])
+        stats["margins"] = finished["vote_margin"].to_numpy(dtype=np.float32)
+        stats["distances"] = finished["neighbor_distance"].to_numpy(dtype=np.float32)
+        labels = finished[stats["groupby"]].astype(str)
+        lookup = {str(name): i for i, name in enumerate(stats["categories"])}
+        recounted = np.zeros(len(stats["categories"]), dtype=np.int64)
+        for name, n in labels.value_counts().items():
+            if name in lookup:
+                recounted[lookup[name]] = n
+        stats["cluster_counts"] = recounted
 
     counts = stats["cluster_counts"]
     total = max(counts.sum(), 1)

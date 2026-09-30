@@ -14,20 +14,50 @@ import { colorForHpc, colorForInflammation, colorForNecrosis } from "../../color
 
 // -- colors not already ported to colors.js --------------------------------
 
-export function colorForMalignant(flag) {
-  if (flag === null || flag === undefined) return [160, 160, 160];
-  if (typeof flag === "number" && Number.isNaN(flag)) return [160, 160, 160];
-  let f = flag;
-  if (typeof f === "number") {
-    f = Boolean(f);
-  } else if (typeof f === "string") {
-    const s = f.trim().toLowerCase();
-    if (["true", "t", "1", "yes", "y"].includes(s)) f = true;
-    else if (["false", "f", "0", "no", "n"].includes(s)) f = false;
-    else return [160, 160, 160];
-  } else {
-    f = Boolean(f);
+// Port of backend/malignancy.py. That module exists because app_v28.py used to
+// carry two independent normalisations of `hpc_dictionary.malignant` — the
+// viewer's colour lookup and its filter — and they disagreed: the colour
+// lookup did not recognise the spellings "malignant"/"non-malignant", so a
+// dictionary row written that way rendered grey while the filter counted it
+// correctly. malignancy.py fixed that by making both read one rule; this is
+// that same rule; ported so the two JS call sites (colour, filter/legend
+// bucketing) can't drift from each other the same way again.
+//
+// Recognised spellings, lower-cased and stripped — verbatim from
+// backend/malignancy.py's _TRUE / _FALSE, which were themselves taken
+// verbatim from the two normalisations this replaced.
+const MALIGNANT_TRUE = new Set(["true", "t", "1", "yes", "y", "malignant"]);
+const MALIGNANT_FALSE = new Set(["false", "f", "0", "no", "n", "non-malignant", "non malignant"]);
+
+// Port of malignant_flag(): true / false / null. null means "this row does
+// not say" — a NULL or a spelling not in the recognised vocabulary — kept
+// distinct from non-malignant so a dictionary row that needs attention stays
+// visible (grey) rather than being counted as benign.
+export function malignantFlag(value) {
+  if (value === null || value === undefined) return null;
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number") {
+    if (Number.isNaN(value)) return null;
+    if (value === 0 || value === 1) return Boolean(value);
+    return null;
   }
+  const s = String(value).trim().toLowerCase();
+  if (MALIGNANT_TRUE.has(s)) return true;
+  if (MALIGNANT_FALSE.has(s)) return false;
+  return null;
+}
+
+// Port of describe_malignant(): "malignant" / "non-malignant" / "missing",
+// never null. Used for filtering and legend bucketing.
+export function describeMalignant(value) {
+  const flag = malignantFlag(value);
+  if (flag === null) return "missing";
+  return flag ? "malignant" : "non-malignant";
+}
+
+export function colorForMalignant(flag) {
+  const f = malignantFlag(flag);
+  if (f === null) return [160, 160, 160];
   return f ? [255, 80, 80] : [80, 200, 120];
 }
 
@@ -39,19 +69,9 @@ export function colorForAdjacencyGroup(groupName) {
 
 // -- category-key helpers (used for filtering + legend bucketing) ----------
 
-// Matches app_v28.py's `_mal_filter_value` (used for the mal_f filter) and
-// the bucketing inline in the "Malignant" legend loop — both collapse to the
-// same three buckets, so one function serves both here.
-export function malignantLabelKey(v) {
-  if (v === null || v === undefined) return "missing";
-  if (typeof v === "number" && Number.isNaN(v)) return "missing";
-  if (typeof v === "boolean") return v ? "malignant" : "non-malignant";
-  if (typeof v === "number") return v ? "malignant" : "non-malignant";
-  const s = String(v).trim().toLowerCase();
-  if (["true", "t", "1", "yes", "y", "malignant"].includes(s)) return "malignant";
-  if (["false", "f", "0", "no", "n", "non-malignant", "non malignant"].includes(s)) return "non-malignant";
-  return "missing";
-}
+// Alias kept for callers already using this name (matches app_v28.py's
+// `_mal_filter_value`/inline legend bucketing, now both `describe_malignant`).
+export const malignantLabelKey = describeMalignant;
 
 export function inflammationLabelKey(v) {
   if (v === null || v === undefined) return "missing";
@@ -323,6 +343,76 @@ export function buildOsdOverlayRecords(
   }
 
   return { records, total, truncated: total > maxTiles };
+}
+
+// -- pyramid-viewer hit testing --------------------------------------------
+//
+// "Which tile is under this point" for the OpenSeadragon viewer, kept here
+// with the rest of the DOM-free overlay math so it can be tested without a
+// browser — the alternative is a hit test that only the pointer can exercise.
+//
+// The lattice is what makes this a Map get rather than a scan over every tile
+// on the slide: tile_coordinates stores x_native = col * pitch (the tiler's
+// own stride, whatever the slide's mpp), so the cell containing a point is
+// floor(point / pitch). A scan would also have to run on every mouse move.
+
+// How heavy a grid outline is drawn in the pyramid viewer, given the tile's
+// current width in screen pixels.
+//
+// A constant fraction of the cell, because that is what the click inspector
+// has always drawn — its viewBox is the thumbnail, so its fixed 2-unit stroke
+// is ~4.2% of a tile however the image is scaled on screen. The pyramid
+// viewer's rule was min(4, w/35), which matches that only while a tile is
+// under ~140 px: past there the 4 px cap holds while the cell keeps growing,
+// so at 600 px the outline is 0.67% of the cell — a hairline around a slab,
+// and the reason the same grid reads clearly in one viewer and faintly in the
+// other at exactly the zoom where you are looking at tile boundaries.
+//
+// The floor keeps the line visible when zoomed out; the ceiling stops it
+// eating the tile it is supposed to be framing at extreme zoom.
+export const GRID_STROKE_FRACTION = 0.042;
+export const GRID_STROKE_MIN = 1.5;
+export const GRID_STROKE_MAX = 9;
+
+export function gridStrokeWidth(onScreenTileWidth) {
+  const w = Number(onScreenTileWidth);
+  if (!Number.isFinite(w) || w <= 0) return GRID_STROKE_MIN;
+  return Math.max(GRID_STROKE_MIN, Math.min(GRID_STROKE_MAX, w * GRID_STROKE_FRACTION));
+}
+
+// Drawn under the coloured outline, slightly wider, so the grid reads against
+// both pale H&E and the dark background behind a slide's edge. The HPC colours
+// themselves are not darkened — they are what the legend is keyed on, and a
+// tile whose outline does not match its legend swatch is worse than a faint
+// one.
+export const GRID_HALO_COLOR = "rgba(17, 24, 39, 0.72)";
+export const GRID_HALO_EXTRA = 2.5;
+
+/** Map from "<col>_<row>" to the tile record. */
+export function buildTileLookup(tiles, pitch) {
+  const map = new Map();
+  const p = Number(pitch);
+  if (!tiles || !Number.isFinite(p) || p <= 0) return map;
+  for (const t of tiles) {
+    // col/row come off tile_coordinates when present; a record carrying only
+    // coordinates is placed by them, so this cannot silently drop tiles from
+    // a source that does not have the grid indices.
+    const col = Number.isFinite(Number(t.col)) ? Number(t.col) : Math.floor(Number(t.x_native) / p);
+    const row = Number.isFinite(Number(t.row)) ? Number(t.row) : Math.floor(Number(t.y_native) / p);
+    if (!Number.isFinite(col) || !Number.isFinite(row)) continue;
+    map.set(`${col}_${row}`, t);
+  }
+  return map;
+}
+
+/** The tile containing an image-space point, or null where the slide has no
+ *  tile — background, or tissue below the threshold Stage 1 skipped. */
+export function tileAtImagePoint(lookup, imageX, imageY, pitch) {
+  const p = Number(pitch);
+  if (!lookup || lookup.size === 0 || !Number.isFinite(p) || p <= 0) return null;
+  if (!Number.isFinite(imageX) || !Number.isFinite(imageY)) return null;
+  if (imageX < 0 || imageY < 0) return null;
+  return lookup.get(`${Math.floor(imageX / p)}_${Math.floor(imageY / p)}`) || null;
 }
 
 // -- click-inspector (raster-equivalent) helpers ----------------------------

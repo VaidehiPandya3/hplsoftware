@@ -488,3 +488,22 @@ def _main():
 
 if __name__ == "__main__":
     raise SystemExit(_main())
+
+
+def test_a_pipeline_run_is_never_offered_a_per_stage_button(_tmp=None):
+    """A pipeline run's Stages 1-4 belong to its Nextflow run, and the per-stage
+    endpoints refuse it — so "Start packaging" or "Resume tiling" here would be
+    a button that can only fail. The run's own panel offers Resume."""
+    sentinels = {"job_id": "nf:a:tiling", "h5_job_id": "nf:a:packaging",
+                 "h5_output_path": "/h5/x.h5", "extraction_job_id": "nf:a:extraction",
+                 "extraction_output_path": "/r/x.h5"}
+    completed = {"COMPLETED"}
+    cases = {
+        "tiling running": {"nf:a:tiling": {"RUNNING"}},
+        "tiling failed": {"nf:a:tiling": {"FAILED"}},
+        "tiled, packaging queued": {"nf:a:tiling": completed, "nf:a:packaging": {"PENDING"}},
+        "packaging failed": {"nf:a:tiling": completed, "nf:a:packaging": {"FAILED"}},
+    }
+    for name, states in cases.items():
+        got = roll([run("a", **sentinels)], states=states)["next_action"]
+        assert got["kind"] == "wait", f"{name}: offered {got['kind']!r}"

@@ -221,46 +221,66 @@ def read_manifest_slide(manifest_path: Path, task_id: int) -> Path:
     )
 
 
-def run_worker(args: argparse.Namespace) -> None:
-    """Mask and tile the slide assigned to this Slurm array task."""
+def slide_output_paths(
+    slide_path: Path, mask_dir: Path, tile_dir: Path, dataset_name: str
+) -> dict[str, Path]:
+    """Where one slide's mask and tiles land. Shared by the Slurm-array worker
+    and the Nextflow pipeline's task (hpl-nf/bin/hpl_tile.py), so the two cannot
+    disagree about which files make a slide "done".
+
+    Scoped by dataset_name (not flat under mask_dir directly) so two
+    different datasets — or a dataset and an ad-hoc single-slide upload —
+    whose slide_id-derivation happens to collide can never silently share
+    (and overwrite) the same tissue mask. tile_dir already gets this same
+    treatment; mask_dir didn't, which meant a colliding slide_id here wouldn't
+    just misname a file — the "mask already exists, skip" check would treat a
+    wholly different dataset's leftover mask as this slide's own and tile
+    against it, silently.
+    """
+    slide_id = slide_id_from_raw_path(slide_path)
+    dataset_mask_dir = mask_dir / dataset_name
+    dataset_tile_dir = tile_dir / dataset_name
+    slide_tile_dir = dataset_tile_dir / slide_id
+    return {
+        "dataset_mask_dir": dataset_mask_dir,
+        "dataset_tile_dir": dataset_tile_dir,
+        "mask": dataset_mask_dir / f"{slide_id}_tissue_mask.png",
+        "overlay": dataset_mask_dir / f"{slide_id}_tissue_overlay.png",
+        "slide_tile_dir": slide_tile_dir,
+        "metadata": slide_tile_dir / f"{slide_id}_tile_metadata.csv",
+        "summary": slide_tile_dir / f"{slide_id}_tiling_summary.json",
+    }
+
+
+def tile_one_slide(
+    slide_path: Path,
+    *,
+    mask_dir: Path,
+    tile_dir: Path,
+    dataset_name: str,
+    mask_max_size: int,
+    mask_saturation: float,
+    mask_value: float,
+    target_mpp: float,
+    target_tile_px: int,
+    min_tissue: float,
+    level: int,
+    jpeg_quality: int,
+) -> dict:
+    """Mask and tile one slide, skipping whichever half is already done.
+
+    Raises if the slide still is not completely tiled afterwards, so a caller
+    that returns normally has a slide tiling_output_complete() accepts — the
+    same test packaging's coverage check and a resubmission's skip use.
+    """
     from tile_mask import run_tissue_detection
     from auto_tile_from_mask import tile_slide_from_mask
 
-    task_id_text = os.environ.get("SLURM_ARRAY_TASK_ID")
-    if task_id_text is None:
-        raise RuntimeError("SLURM_ARRAY_TASK_ID is not defined")
-
-    task_id = int(task_id_text)
-    slide_path = read_manifest_slide(args.manifest, task_id)
     slide_id = slide_id_from_raw_path(slide_path)
-
-    # Scoped by dataset_name (not flat under args.mask_dir directly) so two
-    # different datasets — or a dataset and an ad-hoc single-slide upload —
-    # whose slide_id-derivation happens to collide can never silently share
-    # (and overwrite) the same tissue mask. tile_dir already gets this same
-    # treatment via dataset_tile_dir below; mask_dir didn't, which meant a
-    # colliding slide_id here wouldn't just misname a file — the "mask
-    # already exists, skip" check further down would treat a wholly
-    # different dataset's leftover mask as this slide's own and tile
-    # against it, silently.
-    dataset_mask_dir = args.mask_dir / args.dataset_name
-    dataset_mask_dir.mkdir(parents=True, exist_ok=True)
-    dataset_tile_dir = args.tile_dir / args.dataset_name
-    dataset_tile_dir.mkdir(parents=True, exist_ok=True)
-
-    mask_path = dataset_mask_dir / f"{slide_id}_tissue_mask.png"
-    overlay_path = dataset_mask_dir / f"{slide_id}_tissue_overlay.png"
-    slide_tile_dir = dataset_tile_dir / slide_id
-    metadata_path = slide_tile_dir / f"{slide_id}_tile_metadata.csv"
-    summary_path = slide_tile_dir / f"{slide_id}_tiling_summary.json"
-
-    print("=" * 70, flush=True)
-    print(f"Job ID:      {os.environ.get('SLURM_JOB_ID', 'unknown')}", flush=True)
-    print(f"Array task:  {task_id}", flush=True)
-    print(f"Slide:       {slide_path}", flush=True)
-    print(f"Slide ID:    {slide_id}", flush=True)
-    print(f"Dataset:     {args.dataset_name}", flush=True)
-    print("=" * 70, flush=True)
+    paths = slide_output_paths(slide_path, mask_dir, tile_dir, dataset_name)
+    paths["dataset_mask_dir"].mkdir(parents=True, exist_ok=True)
+    paths["dataset_tile_dir"].mkdir(parents=True, exist_ok=True)
+    mask_path, overlay_path = paths["mask"], paths["overlay"]
 
     if mask_path.stat().st_size > 0 if mask_path.exists() else False:
         mask_ok = overlay_path.stat().st_size > 0 if overlay_path.exists() else False
@@ -273,16 +293,18 @@ def run_worker(args: argparse.Namespace) -> None:
         print("[RUN] Creating tissue mask...", flush=True)
         run_tissue_detection(
             slide_path=str(slide_path),
-            output_dir=str(dataset_mask_dir),
-            max_size=args.mask_max_size,
-            saturation_threshold=args.mask_saturation,
-            value_threshold=args.mask_value,
+            output_dir=str(paths["dataset_mask_dir"]),
+            max_size=mask_max_size,
+            saturation_threshold=mask_saturation,
+            value_threshold=mask_value,
         )
 
     if not mask_path.exists() or mask_path.stat().st_size == 0:
         raise RuntimeError(f"Expected mask was not created: {mask_path}")
 
-    tile_complete = tiling_output_complete(metadata_path, summary_path, slide_tile_dir)
+    tile_complete = tiling_output_complete(
+        paths["metadata"], paths["summary"], paths["slide_tile_dir"]
+    )
 
     if tile_complete:
         print("[SKIP] Slide already tiled.", flush=True)
@@ -291,15 +313,66 @@ def run_worker(args: argparse.Namespace) -> None:
         tile_slide_from_mask(
             slide_path=str(slide_path),
             mask_path=str(mask_path),
-            output_dir=str(dataset_tile_dir),
-            target_mpp=args.target_mpp,
-            target_tile_px=args.target_tile_px,
-            min_tissue_percent=args.min_tissue,
-            level=args.level,
-            jpeg_quality=args.jpeg_quality,
+            output_dir=str(paths["dataset_tile_dir"]),
+            target_mpp=target_mpp,
+            target_tile_px=target_tile_px,
+            min_tissue_percent=min_tissue,
+            level=level,
+            jpeg_quality=jpeg_quality,
         )
+        # Checked again rather than assumed. The tiler returning is not the
+        # same claim as the slide being complete, and the next stage packages
+        # whatever the metadata CSV promises.
+        if not tiling_output_complete(
+            paths["metadata"], paths["summary"], paths["slide_tile_dir"]
+        ):
+            raise RuntimeError(
+                f"Tiling {slide_id} returned, but its output is not complete: "
+                f"{paths['summary']} and {paths['metadata']} disagree or are missing."
+            )
 
+    summary = json.loads(paths["summary"].read_text(encoding="utf-8"))
     print(f"[DONE] {slide_id}", flush=True)
+    return {
+        "slide_id": slide_id,
+        "slide_path": str(slide_path),
+        "saved_tiles": int(summary.get("saved_tiles", 0)),
+        "skipped": tile_complete,
+    }
+
+
+def run_worker(args: argparse.Namespace) -> None:
+    """Mask and tile the slide assigned to this Slurm array task."""
+    task_id_text = os.environ.get("SLURM_ARRAY_TASK_ID")
+    if task_id_text is None:
+        raise RuntimeError("SLURM_ARRAY_TASK_ID is not defined")
+
+    task_id = int(task_id_text)
+    slide_path = read_manifest_slide(args.manifest, task_id)
+    slide_id = slide_id_from_raw_path(slide_path)
+
+    print("=" * 70, flush=True)
+    print(f"Job ID:      {os.environ.get('SLURM_JOB_ID', 'unknown')}", flush=True)
+    print(f"Array task:  {task_id}", flush=True)
+    print(f"Slide:       {slide_path}", flush=True)
+    print(f"Slide ID:    {slide_id}", flush=True)
+    print(f"Dataset:     {args.dataset_name}", flush=True)
+    print("=" * 70, flush=True)
+
+    tile_one_slide(
+        slide_path,
+        mask_dir=args.mask_dir,
+        tile_dir=args.tile_dir,
+        dataset_name=args.dataset_name,
+        mask_max_size=args.mask_max_size,
+        mask_saturation=args.mask_saturation,
+        mask_value=args.mask_value,
+        target_mpp=args.target_mpp,
+        target_tile_px=args.target_tile_px,
+        min_tissue=args.min_tissue,
+        level=args.level,
+        jpeg_quality=args.jpeg_quality,
+    )
 
 
 def _run_sbatch_with_retry(

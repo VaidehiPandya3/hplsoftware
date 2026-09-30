@@ -57,12 +57,96 @@ dedicated `submit_*.py` modules that build and run their own `sbatch`. Stage 1 a
 wrapper, `submit_dataset_tiling.sh`, which expects a `mask_and_tile_array.sbatch` alongside it that is
 not in this repo — it lives on the cluster. Stage 2's submission is
 driven by the server's `/package` endpoint, and `make_hpl_hdf5.package_slides_to_h5` is additionally
-imported and called in-process on the single-slide upload path. Stages 5 and 6 submit no Slurm job at
-all — `register_dataset.py`'s and `load_hpc_assignments.py`'s functions run in-process inside
-`tile_server_v2_.py` (`/register-preview`, `/register`, `/kb-load-preview`, `/kb-load`), so
-`registration_done` and `kb_load_done` are the only state tracked for them
-(`migrate_dataset_runs_registration.sql`, `migrate_dataset_runs_kb_load.sql`), with no
-job_id/slurm_state pair.
+imported and called in-process on the single-slide upload path (see the one-slide run below). Stages 5 and 6 can run **either**
+way: `register_dataset.py`'s and `load_hpc_assignments.py`'s functions run in-process inside
+`tile_server_v2_.py` (`/register-preview`, `/register`, `/kb-load-preview`, `/kb-load`), and the same
+two CLIs are submitted to Slurm by `submit_kb_write.py` via `/register-submit` and `/kb-load-submit`
+(`migrate_dataset_runs_kb_slurm.sql` adds their job_id/state pair). The in-process path was never
+lost to a closed browser — FastAPI runs a sync endpoint in a threadpool and uvicorn does not cancel it
+on client disconnect — but it dies with the server, which is why the Slurm path exists. `registration_done`
+and `kb_load_done` mean *committed* on both paths: on the Slurm path the **job** sets them, through
+`--record-run` and `run_record.py`, because the job is the only process that knows.
+
+**A single uploaded slide is a one-slide run, not a separate pipeline.**
+`/upload-slide` creates its own `slurm_dataset_runs` row (`_start_upload_run`) and
+`_run_postupload_pipeline` records Stages 1 and 2 against it as they finish in this process, so the
+same UI stepper and the same Stage 3-6 endpoints carry an upload the rest of the way. Three things
+make that work, and each is the kind that fails silently if changed back:
+
+- **The sentinel job id.** Every later stage gates on "which Slurm state is this stage in", and an
+  in-process stage has no job. It records `local:<stage>` instead (`LOCAL_JOB_ID_PREFIX`), which
+  `_get_slurm_job_state` reads as COMPLETED — written only *after* the stage returned, and still
+  subject to `_job_output_ready`'s validator, which opens the `.h5`. Every Slurm query helper strips
+  these before asking, because sacct and squeue reject a whole call for one id they do not know: a
+  sentinel reaching them would report "can't reach Slurm" for every real run listed beside it.
+- **One cohort per uploaded slide,** `UPLOADED_<SLIDE_ID>` (`upload_dataset_name`), used as the
+  `dataset_id`, the tile folder and the run's `dataset_name` at once. `register_dataset.commit()`
+  scopes `--replace` to a `dataset_id` and DELETEs what it finds there, so the old shared `UPLOADED`
+  bucket would have meant registering the second uploaded slide either refused or deleted the first.
+  The prefix is what still keeps a bulk dataset folder from colliding with a slide_id, and it is why
+  `_is_upload_dataset_id` is a prefix test — rows written before this carry the bare `UPLOADED`.
+  Registering an upload always needs **Replace**, because the upload already wrote that slide's
+  `wsi_registry` row so the viewer could open it immediately; the delete is scoped to that one slide.
+- **The saved filename,** `{slide_id}_{uuid}_{original}`. Registration finds each raw slide through
+  `slide_naming.slide_id_from_raw_path()`, and a name that does not parse is not an error — it
+  registers a cohort with no `wsi_registry` row, and the viewer 404s on a slide sitting on disk.
+
+`backend/tests/test_upload_pipeline.py` pins all three.
+
+**New runs are one click: Stages 1-4 as one Nextflow run, like ANORAK.** The dataset panel in both
+UIs takes one input — the dataset path — and two buttons, **Run HPL** and below it **Run ANORAK**,
+either usable on its own; one shared "Test on a random subset" option (slide count + recorded seed)
+applies to both. Below them: the latest HPL run, the latest ANORAK run, and a collapsed **History**
+with every run (cancelled included). The panel uses no emoji — states are words (`[Done]`). The
+HPL request carries only the path; everything else is the server's (`GET /pipeline-defaults`): tile
+folder = the directory's name, `HPL_CHECKPOINT`, `HPC_REFERENCE_PATH`, the tuned vote,
+`HPL_NF_MAX_TILING` (50) slides at a time, and earlier complete outputs at the run's paths *moved*
+into `superseded-<stamp>/` beside them (never deleted; refused while any recorded job may be
+writing them). Runs from before the pipeline are shown read-only under "Earlier runs"; their
+per-stage buttons are gone. Upload runs keep their Stage 3/4 buttons — an uploaded slide does not
+go through the pipeline — and Stages 5-7 keep theirs everywhere. `POST /pipeline-runs`
+submits `hpl-nf/` through `submit_hpl_nf.py`: one
+supervised head job (`head_sbatch_command()`, chain of standbys, and the watchdog at
+`hpl-nf/tools/nf_supervise.sh`, a symlink to ANORAK's that submission refuses if it has drifted),
+whose tasks run the per-stage wrappers in `hpl-nf/bin/` — which import and call the *same* tiler,
+packager and container command builders from `backend/`, so there is one copy of the `--cleanenv`
+rules. `hpl-nf/` is laid out like `anorak-nf/` (README, `bin/`, `conf/`, `tools/preflight.py`,
+`tools/test_workflow_*.py`), and it and `backend/` must reach the cluster together. Every
+refusal the per-stage submitters make is made up front by `resolve_run()`, before the queue. Stages 5
+and 6 stay manual, with their dry runs. How the rest of the server sees such a run:
+
+- Its four stage job-id columns hold `nf:<submission_id>:<stage>` sentinels (`hpl_nf_state.py`),
+  stripped from every Slurm query exactly like `local:`, and resolved from the run directory
+  (`HPL_NF_RESULTS_ROOT/<submission_id>`): COMPLETED **only** on `stages/<stage>.done.json`, which the
+  stage's last task writes after the server's own validator (`stage_outputs.py`) accepts the output,
+  bound to the previous stage's row count. A head job that exited 0 without a marker reads FAILED.
+  Output paths are recorded at submission, so `_job_output_ready` still has the last word.
+- No migration: the sentinel in `job_id` *is* the record that a run is a pipeline run.
+- The per-stage endpoints refuse a pipeline run (`_refuse_if_pipeline_run`); recovery is
+  `/pipeline-resume`, and each task skips an output that already validates — which is only safe
+  because `refuse_foreign_outputs()` stops a fresh run from starting over another run's outputs.
+- A shard retried after a crash clears its own half-written part before the encoder sees it —
+  the encoder treats any existing output as done and crashes on it, and the plan step clears only
+  before the *first* attempt. An unreadable slide stops the run unless it was started or resumed
+  with `allow_incomplete`, in which case the tiling gate leaves it out of
+  `manifest.packaged.txt` (what packaging reads) and names it in the marker. Resume reuses the
+  Nextflow params recorded in `run_config.json` (`resume_params`), re-choosing only the GPU type.
+- **Run ANORAK** (`POST /anorak-runs`) is its own run: a `slurm_dataset_runs` row whose status is
+  `anorak_only` for life (it is the run's kind — cancel and errors do not overwrite it), submitted
+  through Stage 7's own `_submit_anorak`. With no tumour-slide list it grades every slide ANORAK can
+  read (`slide_list_from_directory`: slide_id = file stem, samples by HPL's
+  `sample_from_slide_id`, `is_tumour = unverified`); only that server-built list may pass
+  `tumour_verified=False`, and a list that says a slide is *not* tumour is refused regardless.
+  `/anorak-resume` repeats a run from its own `slide_list.selection.json`.
+- `hpl-nf/tools/test_workflow_*.py` make each per-stage guard fail and run real Nextflow in
+  `-stub` mode; `backend/tests/test_hpl_nf_pipeline.py` covers the sentinels and the stepper.
+
+**A Slurm-backed KB write needs Postgres reachable from a compute node,** and nothing about the
+server's own connection tells you whether it is. `DB_HOST=127.0.0.1` means the compute node itself,
+and a unix socket path is local to the database's machine however shared the filesystem is — so
+`submit_kb_write.resolve_job_db_host()` refuses both at submit time and demands `HPL_JOB_DB_HOST`.
+Check it once with `python backend/submit_kb_write.py --check-db` (or `GET /kb-job-db-check`), which
+sruns a one-second TCP probe from an actual compute node.
 
 **Stage 5 exists because Stage 6 only ever `UPDATE`s.** `load_hpc_assignments.load()` sets
 `tile_registry.hpc_id` on rows that must already be there, so for a cohort that has never touched the
@@ -151,6 +235,36 @@ raising `--batch-size` buys almost nothing; h5py serialises HDF5 calls on a glob
 threads do not parallelise decode (separate processes do — hence `--shards`); and falling back from an
 H200 to an H100/A100 costs almost nothing in wall clock.
 
+**`--cleanenv` means the container cannot read Slurm's variables.** Stages 3 and 4 run their
+work inside `singularity exec --cleanenv`, which wipes the environment before the inner shell
+starts — so a thread count written as `${SLURM_CPUS_PER_TASK:-1}` and expanded in there always
+took the fallback, and every cluster assignment ran on one core while Slurm held 16. Nothing
+failed and nothing warned: a 2.5M-row reference at 127 dims came to 49 tiles/s, and 18.5M tiles
+took three days instead of hours. Thread counts are baked in at submit time now
+(`_build_assignment_command(threads=...)`), which means the number and the sbatch's
+`--cpus-per-task` live in different strings and must be changed together —
+`test_assign_streaming.py` pins both.
+
+The same door let a second one through: `SLURM_ARRAY_TASK_ID`, which the shard preamble used
+to index its bounds arrays *inside* the container. Under `set -u` that aborted every array task
+the moment the import check finished — stdout ending at "container packages: ok", the array
+purged, and the merge left on `DependencyNeverSatisfied` with nothing in the log but the place it
+stopped. The bounds are resolved outside the container now and passed in via
+`SINGULARITYENV_`/`APPTAINERENV_`, which is the documented route through `--cleanenv`, and the
+`set -u` check stays out there where an unset index really does mean a sharded command was
+submitted as a plain job. `submit_feature_extraction.py` had the same pattern (`shard_preamble` inside `inner`) until
+2026-09-28; it now resolves the range outside the container the same way.
+
+And a third: `CUDA_VISIBLE_DEVICES`, which is how Slurm tells each `--gres=gpu:1` task which
+physical card is its own. Stripped, every task on a node sees all of them and
+`index_cpu_to_gpu(res, 0, ...)` puts them all on GPU 0 — N shards contending for one device
+while the rest idle, failing at no point. Passed through the same way, defaulting to 0 so a
+hand-run job outside Slurm still works.
+
+Assume nothing the job needs from the submitting environment survives, and note that a string
+assertion cannot catch this class — every broken version looked correct. The tests run the
+generated shell against a stand-in that strips the environment the way `--cleanenv` does.
+
 **GPU type names are cluster-specific and matching is exact.** This cluster has `nvidia_h200`,
 `nvidia_h100_80gb_hbm3`, `nvidia_h100_pcie`, `nvidia_a100_80gb_pcie`. A preference list naming types
 that do not exist is inert, not approximate — it silently falls through to queueing for the first one.
@@ -161,14 +275,152 @@ the mean over *all* queries, so chunking or sharding the assignment changes the 
 is computed once and shared (`--precompute-mean` / `--query-mean`). `project()` therefore refuses to
 derive a mean from the chunk it was handed. Sharding without the shared mean is rejected outright.
 
+**Stage 4 resumes; Stage 3 does not.** A preempted or requeued assignment task used to restart
+its whole range. Chunks are checkpoints now: each is written under a `.tmp` name and renamed, so a
+chunk file exists only if it is whole, and `<out>.chunks/` survives a kill while the `.partial`
+does not. Resume is automatic and unconditional — a requeued job re-runs the identical command
+line, so anything needing a flag would never happen on the attempt that needed it. The chunk
+directory carries a manifest of everything that could change a label (reference, vote, centering,
+chunk size, rep_key, row range, query mean) and **refuses** to resume across a difference, because
+that is two computations concatenated into one CSV with nothing to say which rows came from where.
+Device is deliberately excluded, so a preempted GPU shard can finish on a CPU; the manifest records
+which devices contributed. The equivalence test is the point: a killed-and-resumed run must be
+byte-identical to an uninterrupted one. Note the summary statistics are read back from the
+assembled CSV after a resume, since the in-memory arrays only cover the chunks that attempt
+computed.
+
 **The encoder has no resume and mishandles its own leftovers.** It creates the output with `mode='w'`
 before encoding, and its "output already exists" path crashes on an unbound local. So any interrupted
 attempt makes every retry fail in seconds with an error pointing nowhere near the cause — which is why
 `validate_extraction_output()` exists and stale outputs are cleared before resubmission.
 
+**Short tile names are repaired on read, not refused — except when mixed.** A `.h5` or
+assignments CSV packaged before make_hpl_hdf5.py stored the suffix holds `18_15`, which joins
+nothing in a KB keyed on `..._18_15.JPEG`. `register_dataset.py` and `load_hpc_assignments.py`
+append `.jpeg` themselves (`slide_naming.normalize_tile_names`) and report the count, because
+`auto_tile_from_mask.py:150` writes every tile as `{col}_{row}.jpeg`, which makes the mapping a
+bijection rather than a guess. Both sides must be normalised — the `.h5` *and* Stage 1's
+metadata CSVs — or the refusal just becomes `tiles_with_coordinates: 0`. A **mixed** file (some
+names suffixed, some not) is still refused: that is a resume that straddled the fix, the two
+sides are indistinguishable by name, and appending would attach correct cluster IDs to the wrong
+tiles. Note `tiles_missing_suffix()` cannot see that case — it samples 100 names and needs them
+all short — which is why `tile_name_verdict()` reads every name. `migrate_tile_names.py` still
+exists and is still the only fix for the artifacts on disk, and for mixed.
+
+**Stage 6 writes with one statement, and the scratch table it joins is not KB
+state.** The load used to send one `UPDATE ... WHERE UPPER(slide_tile) = :tile`
+per tile through `executemany`, and the preview used to send 1,850 expanding-`IN`
+queries of 10,000 keys each. At 18.5M tiles that is ~20M statement executions,
+preceded by a Python list of 18.5M six-key dicts. Both are one statement now,
+joined against a scratch table (`kb_stage.py`) that `COPY`s the CSV in on
+several connections at once. The parallelism is only sound because the scratch
+table is *not* Knowledge Bank state — a half-staged table is discarded and
+remade, never repaired — which is why staging happens outside the write's
+transaction and the write itself is still one transaction covering the tiles and
+both aggregates. `stage_frame()` verifies the staged row count against the frame
+before anything joins against it, because a scratch table short by a slice would
+update a subset of the cohort and report success.
+
+Three consequences worth knowing before touching it. A **duplicate
+`slide_tile`** is now refused at read time: the old per-row writer applied
+duplicates in file order and let the last win, whereas `UPDATE ... FROM` picks an
+arbitrary match, so which one survived would be a property of the query plan.
+An **empty `vote_margin`** is refused for the same reason — it used to be written
+as `float('nan')` and `COPY`'s CSV format reads an empty field as NULL, so the two
+writers disagreed on exactly those rows. And `--rebuild-hpc-index` is **off by
+default**: dropping `idx_tr_hpc_id` for the duration is less total work, because
+an indexed `hpc_id` means none of these updates can be HOT, but `DROP INDEX`
+holds an ACCESS EXCLUSIVE lock on `tile_registry` for the whole transaction, so
+the viewer and the chatbot block until the load commits.
+
+`migrate_indexes.sql` §8 is still what makes any of this fast — the join
+predicate is `UPPER(tile_registry.slide_tile)`, and without
+`idx_tr_slide_tile_upper` the planner has only a sequential scan. And the write
+leaves a dead row version per updated tile, roughly doubling `tile_registry` on
+disk, which is why `VACUUM ANALYZE` runs afterwards (outside the transaction,
+where it must be, and never fatally — the rows are committed by then).
+
+**Tile pitch is a property of the slide, not of the deployment.** Tiles are tessellated at 1.8
+µm/px, so their stride in native pixels is `round(224 * 1.8 / native_mpp)` — 1600 at 0.252 µm/px,
+1734 at 0.2325, 804 on a 20x scan. Only 520 of the 1,598 slides in `wsi_metadata` are 0.252. The
+tile server published that one number as `tile_size_native` for every slide, and every overlay in
+both UIs sizes its rectangles from it, so the grid was drawn undersized on the 468 finer slides
+(a visible gutter, up to 10.1% of the pitch) and at roughly twice the tile on the 610 coarser
+ones. `_tile_size_native()` resolves it per slide now, preferring the pitch read back off
+`tile_coordinates` (`x_native = col * pitch`, so the rows carry the stride Stage 1 actually used,
+whatever defaults were in force) over re-deriving it from mpp, and `/slide/{id}/info` names which
+in `tile_size_native_source`. `native_tile_px()` in `auto_tile_from_mask.py` is the single
+definition — the tiler calls it and the server imports it, because a box has to land on the same
+integer as the tile under it. The same constant was the grid `_compute_adjacency` indexed on,
+where a wrong pitch does not collide cells but *skips* them: at 1734 every twelfth column is
+empty and the two tiles either side of it stop being neighbours. It reads `col`/`row` now, which
+the tiler already wrote. The pyramid viewer's hover/click hit test is the third reader of the
+same number — it answers "which tile is under the pointer" as `floor(point / pitch)` against a
+`col_row` map (`buildTileLookup`/`tileAtImagePoint`, and `build_osd_tile_index` on the Streamlit
+side), so the wrong pitch there names the tile next door with no sign that it has.
+
+**The ANORAK head job can go idle with nothing failing, so it runs Nextflow under a watchdog.**
+Stage 7 (`submit_anorak_nf.py`) submits one head job running `nextflow run`, which submits a job
+per slide per step itself. Nextflow notices finished tasks on a single "Task monitor" thread that
+reads each task's `.exitcode` off CephFS. On 2026-09-23 one read, landing while another node was
+still writing that file, blocked in the CephFS kernel client (`wait_woken`) and never returned:
+every job after it finished in Slurm uncollected, all `queueSize` slots stayed "busy", and 7,161
+tasks sat unsubmitted for five hours while the submitter thread kept the log growing. No Nextflow
+setting can time out a read stuck below the JVM. `anorak-nf/tools/nf_supervise.sh` counts
+`[Task monitor]` log lines — the monitor logs a summary every `executor.dumpInterval` while
+anything runs — and after 30 min of silence stops Nextflow, `scancel`s this run's jobs (matched
+by work directory) and restarts it with `-resume`. Watch the monitor's lines, not the log's size
+or mtime: those looked alive the whole time. To see a live head job's threads,
+`srun --jobid=<head> --overlap jstack <java pid>` (the JVM runs as `-jar nextflow-*-one.jar`, so
+`pgrep -f nextflow.cli.Launcher` finds nothing). `test_anorak_watchdog.py` runs the real script.
+
+The watchdog's first real restart (job 1250456, 2026-09-23) died in one second: the submitter
+already passes `-resume`, the supervisor appended a second, and Nextflow refuses a repeated option.
+Every test had built its own command and used a fake `nextflow` more permissive than the real one.
+So the fakes now refuse what Nextflow refuses, a test restarts the command `build_nextflow_command()`
+actually builds, and the same audit found three more of the kind: Nextflow rotates the `-log` file at
+startup (the old count armed the watchdog before this attempt's monitor existed), a TERM near the
+time limit waited forever on a wedged Nextflow, and `--dependency=afternotok` woke every chain
+standby on any fast failure, including `scancel`. A final outcome now writes `nf_supervise.stop` in
+the outdir, which every later head job reads and exits on; the submitter clears it on a fresh submit.
+
+**ANORAK exit 65 is a refusal; everything else is retried.** Every `bin/` wrapper refuses through
+`anorak_common.refuse()`, and `nextflow.config` finishes the run on 65 alone. The old list retried
+only kill signals and finished on `Integer.MAX_VALUE` (a `.exitcode` Nextflow could not read —
+routine on CephFS) and on 1. **Nextflow wipes the container's environment** (`env - ... singularity
+exec`), so `CUDA_VISIBLE_DEVICES` crosses only via `singularity.envWhitelist` — the `--cleanenv`
+lesson above, again. **Cache keys include code:** TILE_SLIDE, PREDICT_GP and SS1_STITCH take a digest
+of their `bin/` scripts, the upstream AIgrading files they import, the checkpoint and the image,
+because `python3 ${projectDir}/bin/x.py` is not hashed and Nextflow keys a container by path, not
+bytes; so editing heavy-step code mid-cohort re-runs the cohort. `meta` is `[id, slide_name]` only —
+the sample joins at SLIDE_PROPORTIONS, so relabelling a tumour re-grades without re-tiling.
+`tools/test_workflow_cache.py` runs real Nextflow to pin each of these.
+
 **Reference `.npz` keys are `reference, components, codes, categories, n_neighbors, meta` (+ optional
 `mean`).** There is no `labels` key. `build_hpc_reference.save()` is the authority;
 `test_reference_keys_match_the_builder` round-trips through it so readers cannot drift.
+
+**`--device` defaults to `auto`, and `auto` never lowers the correctness bar.** The submitter
+resolves it before any node exists, from the one observable it has — whether the GPU extras were
+bootstrapped (`resolve_device()`) — and prints the choice with its reason. The job resolves its own
+`auto` against the GPU actually in front of it and prints the fallback. `gpu` refuses rather than
+falling back; `cpu` never tries. What no mode does is accept a GPU index that disagrees with the CPU
+one: that means a broken build, which would produce a complete CSV of wrong cluster IDs whatever
+asked for it. A `--gres=gpu:1` on a partition advertising no GPUs is also refused at submit time,
+because it otherwise pends forever as `ReqNodeNotAvail` and reads like a busy queue.
+
+**The GPU search is the same exact scan, and it is verified rather than trusted.** `--device gpu`
+moves the flat index to GPU 0 (`GpuIndexFlat` compares every query against every reference vector,
+exactly as `IndexFlat` does), which is why it is admissible where faiss-ivf was not. It needs a
+*separate* extras directory — `HPL_CONTAINER_EXTRAS_GPU`, populated by
+`submit_feature_extraction.py --bootstrap-extras-gpu` — because faiss-cpu and GPU faiss both import
+as `faiss` and PYTHONPATH cannot hold both. `Searcher._verify_matches_cpu` searches a sample of the
+reference against both indexes at startup and refuses on disagreement: a build can expose
+`StandardGpuResources`, report `get_num_gpus() == 1`, accept `index_cpu_to_gpu`, and still be a stub
+that returns well-formed nonsense. Measured on a working build, CPU and GPU agree 100% on the nearest
+neighbour and ~99.99% across k=25, with near-ties reordering inside the list. `--device gpu` also
+means the GPU partition, so pair it with `--shards`: a shard is the checkpoint that makes preemption
+cost one task rather than the run.
 
 **k-NN search is faiss-only, exact, with no backend choice.** `Searcher` in `assign_hpc_clusters.py`
 requires `faiss` and always builds an exact flat index (`IndexFlatL2`) — there is no numpy fallback and

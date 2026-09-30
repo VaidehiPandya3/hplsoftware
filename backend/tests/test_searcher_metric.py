@@ -83,7 +83,10 @@ def test_l2_metric_is_unchanged():
     diffs = reference[idx] - query[:, None, :]
     expected = np.sum(diffs ** 2, axis=2)
     np.testing.assert_allclose(dist, expected, atol=1e-3)
-    assert Searcher(reference).backend == "faiss-flat"
+    # device="cpu" explicitly: the default is "auto" now, and on a host with a
+    # working GPU faiss that yields "faiss-flat-gpu" — the same exact scan, but
+    # this test is about the l2 metric, not about which hardware ran it.
+    assert Searcher(reference, device="cpu").backend == "faiss-flat"
 
 
 def test_unknown_metric_rejected():

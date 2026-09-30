@@ -70,6 +70,9 @@
 -- Which KB each of those two stages wrote to. Run tracking stays in
 -- production, so without this a run says it registered and not where.
 \ir migrate_dataset_runs_kb_target.sql
+-- Both of those stages now submit a Slurm job instead of writing inside the
+-- request, so each needs the job_id/state pair the other stages have.
+\ir migrate_dataset_runs_kb_slurm.sql
 
 \echo '== slide processing status =='
 \ir migrate_processing_status.sql

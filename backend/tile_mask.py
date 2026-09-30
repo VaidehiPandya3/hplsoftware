@@ -144,9 +144,10 @@ def run_tissue_detection(
 ):
     """slide_id defaults to slide_id_from_raw_path(slide_path) — the raw
     filename convention bulk/GDC datasets already use. Pass it explicitly
-    for a caller whose raw file's storage path isn't name-derivable (e.g.
-    the tile server's ad-hoc uploads, stored under a server-generated UUID
-    with no parseable slide_id embedded in the filename at all)."""
+    for a caller that already knows which slide this is (e.g. the tile
+    server's ad-hoc uploads, where the id is the one the user chose and is
+    already in wsi_registry — agreeing with that record matters more than
+    what the stored filename happens to spell)."""
     slide_path = Path(slide_path)
     slide_id = slide_id or slide_id_from_raw_path(slide_path)
 

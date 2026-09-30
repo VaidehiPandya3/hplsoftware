@@ -354,3 +354,20 @@
   font-size: 12.5px;
   margin: 6px 0;
 }
+
+/* The one-click pipeline form, first in the panel. */
+.pipeline-run-card {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin: 8px 0;
+}
+
+.pipeline-subheading {
+  margin: 12px 0 6px;
+  font-size: 1em;
+}
+
+.pipeline-run-card > .pipeline-subheading:first-child {
+  margin-top: 0;
+}

@@ -9,3 +9,7 @@ scikit-image
 faiss-cpu
 sqlalchemy
 psycopg2-binary
+# Optional: pandas' threaded CSV reader, used by load_hpc_assignments.py for the
+# multi-million-row assignment CSV. Absent, it falls back to the default
+# single-threaded reader rather than failing — see _read_csv.
+pyarrow

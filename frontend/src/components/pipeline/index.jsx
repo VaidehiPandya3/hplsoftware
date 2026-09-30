@@ -3,9 +3,8 @@
 //
 // PipelinePanel is the only export the rest of the app needs — it is fully
 // self-contained: upload panel, the dataset path box, the 10s-polled
-// dataset workspace, and the "start a new run" form (shown directly, or
-// tucked behind an explicit opt-in expander when this path already has
-// runs — see _render_dataset_submit_section).
+// dataset workspace, and — first, always open — the one-click "Run the
+// pipeline" form (see _render_dataset_submit_section).
 import { useEffect, useState } from "react";
 import { findExistingJobForPath } from "./utils";
 import { Expander } from "./widgets";
@@ -14,6 +13,12 @@ import DatasetWorkspace from "./DatasetWorkspace";
 import NewRunForm from "./NewRunForm";
 import "./pipeline.css";
 
+// Run the pipeline (Stages 1-4) — one click, first in the panel. Port of
+// _render_dataset_submit_section: it used to sit below the dataset view, and
+// behind an opt-in expander once the path had runs, to guard against a second
+// full re-tiling. A pipeline run cannot do that — slides already tiled on disk
+// are skipped — and what it can collide with (another run's finished .h5) the
+// server refuses, with the choice to move those outputs aside.
 function SubmitSection({ datasetPath }) {
   const [existingJob, setExistingJob] = useState(undefined); // undefined = loading
   const [refreshTick, setRefreshTick] = useState(0);
@@ -29,36 +34,16 @@ function SubmitSection({ datasetPath }) {
     };
   }, [datasetPath, refreshTick]);
 
-  if (!datasetPath) {
-    return <div className="pipeline-caption">Enter a dataset path above to start a new run.</div>;
-  }
-
-  if (existingJob === undefined) {
-    return <div className="pipeline-caption">Checking for existing runs…</div>;
-  }
-
-  if (!existingJob) {
-    return (
-      <div>
-        <div className="pipeline-caption">Start a new dataset run</div>
-        <NewRunForm datasetPath={datasetPath} onSubmitted={() => setRefreshTick((t) => t + 1)} />
-      </div>
-    );
-  }
-
   return (
-    <div>
-      <div className="pipeline-caption">
-        This path already has runs — the newest went in {existingJob.submitted_at || ""}. Their
-        progress is above; resume from there rather than starting again.
-      </div>
-      <Expander title="Submit a separate NEW run for this same path anyway">
+    <div className="pipeline-run-card">
+      {datasetPath && existingJob && (
         <div className="pipeline-caption">
-          Only use this if you deliberately want a second, independent run (e.g. a different
-          tissue threshold) — it will NOT resume or affect the runs shown above.
+          This path already has runs (newest {existingJob.submitted_at || ""}), in History below. A new HPL run
+          reuses every slide already tiled. If a run is still going, follow or resume it below instead of
+          starting another.
         </div>
-        <NewRunForm datasetPath={datasetPath} onSubmitted={() => setRefreshTick((t) => t + 1)} />
-      </Expander>
+      )}
+      <NewRunForm datasetPath={datasetPath} onSubmitted={() => setRefreshTick((t) => t + 1)} />
     </div>
   );
 }
@@ -85,11 +70,13 @@ export default function PipelinePanel() {
           </span>
         </div>
 
-        <DatasetWorkspace path={datasetPath.trim()} />
+        {/* The one-click pipeline first, as ANORAK's button is first in its
+            step; what has already been done to the dataset follows. */}
+        <SubmitSection datasetPath={datasetPath.trim()} />
 
         <hr className="pipeline-divider" />
 
-        <SubmitSection datasetPath={datasetPath.trim()} />
+        <DatasetWorkspace path={datasetPath.trim()} />
       </Expander>
     </div>
   );

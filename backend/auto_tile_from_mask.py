@@ -1,6 +1,7 @@
 from pathlib import Path
 import argparse
 import json
+import math
 
 import openslide
 import numpy as np
@@ -74,12 +75,43 @@ def get_tissue_percent_from_mask(mask, x, y, tile_size, slide_w, slide_h):
     return float(tile_mask.mean() * 100)
 
 
-def get_native_mpp(slide: openslide.OpenSlide) -> float:
-    mpp_x = slide.properties.get("openslide.mpp-x")
+def parse_native_mpp(mpp_x) -> float | None:
+    """The µm/px a slide reports, or None if it does not report a usable one.
+
+    Separate from get_native_mpp because a caller that has to *say* where its
+    number came from needs to know whether the slide supplied one — and
+    because a slide reporting "0" used to reach the division below as a
+    ZeroDivisionError rather than the documented fallback."""
     try:
-        return float(mpp_x)
+        mpp = float(mpp_x)
     except (TypeError, ValueError):
-        return DEFAULT_NATIVE_MPP
+        return None
+    if not math.isfinite(mpp) or mpp <= 0:
+        return None
+    return mpp
+
+
+def get_native_mpp(slide: openslide.OpenSlide) -> float:
+    mpp = parse_native_mpp(slide.properties.get("openslide.mpp-x"))
+    return DEFAULT_NATIVE_MPP if mpp is None else mpp
+
+
+def native_tile_px(
+    native_mpp: float,
+    target_mpp: float = TARGET_MPP,
+    target_tile_px: int = TARGET_TILE_PX,
+) -> int:
+    """The native-pixel side of one tile, which is also the stride between
+    tiles: the loop below tessellates, so pitch and tile size are one number.
+
+    This is the only place that arithmetic lives, because anything drawing a
+    box around a tile has to land on exactly the same integer. The tile server
+    hardcoded `int(224 * 1.8 / 0.252)` = 1600 for every slide, while this
+    derives it per slide from the slide's own mpp — so on the 1,078 of 1,598
+    TCGA slides that are not 0.252 µm/px the viewer's grid was drawn at the
+    wrong size, gapped on a finer scan and overlapping on a 20x one."""
+    scale = target_mpp / native_mpp
+    return round(target_tile_px * scale)
 
 
 def tile_slide_from_mask(
@@ -109,8 +141,7 @@ def tile_slide_from_mask(
     slide_w, slide_h = slide.level_dimensions[level]
 
     native_mpp = get_native_mpp(slide)
-    scale = target_mpp / native_mpp
-    tile_px_native = round(target_tile_px * scale)
+    tile_px_native = native_tile_px(native_mpp, target_mpp, target_tile_px)
 
     mask = load_mask(mask_path)
 

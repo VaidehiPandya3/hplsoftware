@@ -1,31 +1,32 @@
 {
-  "intent": "slide_query",
+  "intent": "hpc_query",
   "entities": {
-    "tile": [
-      "['55-7574-01Z-00-DX1']"
-    ],
+    "tile": [],
     "slide": [],
-    "hpc": [],
+    "hpc": [
+      "40"
+    ],
     "sample": []
   },
   "flags": {
-    "malignant": true,
+    "malignant": null,
     "non_malignant": null,
     "survival": null
   },
   "operations": [
-    "malignancy_lookup",
-    "slide_malignant_coverage"
+    "active_slide",
+    "current_session_context",
+    "highlight_mode"
   ],
   "ui_actions": {
     "open_slide_viewer": true,
-    "show_tile_preview": true,
+    "show_tile_preview": false,
     "explore_hpc_slides": false,
-    "highlight_mode": "Malignant",
-    "selected_hpc": null
+    "highlight_mode": "HPC clusters",
+    "selected_hpc": 40
   },
   "confidence": 0.9,
   "planner": "hybrid",
   "llm_reasoning": "",
-  "enriched_query": "show me malignant tile in TCGA-55-7574-01Z-00-DX1"
+  "enriched_query": "HPC 40"
 }

@@ -26,6 +26,7 @@ import openslide
 import pandas as pd
 from PIL import Image
 from sqlalchemy import create_engine
+from db_url import database_url
 
 # ---------------------------------------------------------------------------
 # Config — match your HPCC environment
@@ -44,7 +45,8 @@ JPEG_QUALITY = 85
 
 def get_wsi_map():
     engine = create_engine(
-        f"postgresql+psycopg2://{DB_USER}:{DB_PASS}@{DB_HOST}:{DB_PORT}/{DB_NAME}",
+        database_url(DB_NAME, user=DB_USER, password=DB_PASS,
+                     host=DB_HOST, port=DB_PORT),
         pool_pre_ping=True,
     )
     df = pd.read_sql("SELECT slide_id, hpc_path FROM wsi_registry", engine)

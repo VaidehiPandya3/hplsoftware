@@ -249,13 +249,13 @@ def test_migrated_csv_joins_what_the_loader_builds(tmp_path):
     csv = tmp_path / "d.csv"
     _write_csv(csv, ["24_10", "25_10"])
 
-    # Before: refused outright.
-    try:
-        read_assignments(csv)
-    except SystemExit as e:
-        assert "extension" in str(e)
-    else:
-        raise AssertionError("the unmigrated CSV must still be refused")
+    # The loader now repairs the short form itself, so the unmigrated CSV loads
+    # — and has to produce exactly the key the migrated one does. Migrating the
+    # file on disk is still worth doing (every other reader of that CSV, and
+    # --validate-against, see the short names), but it is no longer the only
+    # way through.
+    unmigrated, _ = read_assignments(csv)
+    assert unmigrated.attrs["tile_names_normalized"] == 2
 
     migrated = Path(migrate_csv(csv, commit=True)["output"])
     frame, cluster_column = read_assignments(migrated)
@@ -263,6 +263,8 @@ def test_migrated_csv_joins_what_the_loader_builds(tmp_path):
     assert frame["slide_tile"].tolist() == [
         f"{SLIDE.upper()}_24_10.JPEG", f"{SLIDE.upper()}_25_10.JPEG"
     ]
+    assert frame["slide_tile"].tolist() == unmigrated["slide_tile"].tolist()
+    assert frame.attrs["tile_names_normalized"] == 0
 
 
 # --- standalone runner ---------------------------------------------------

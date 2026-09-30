@@ -70,20 +70,9 @@ export function jobLabel(job) {
   return `submission ${(job.submission_id || "").slice(0, 8)}`;
 }
 
-export const RUN_STATE_ICONS = {
-  running: "\u{1F535}",
-  pending: "\u{1F7E1}",
-  complete: "\u{1F7E2}",
-  failed: "\u{1F534}",
-  error: "\u{1F534}",
-  cancelled: "⚪",
-  "no record": "⚫",
-  unknown: "❔",
-  queued: "\u{1F7E1}",
-  discovering: "\u{1F7E1}",
-  submitting: "\u{1F7E1}",
-  submitted: "\u{1F535}",
-};
+// A run's state is written out as a word wherever it is shown; there is no
+// icon for it (these were coloured-circle emoji, which the UI no longer uses).
+export const RUN_STATE_ICONS = {};
 
 export const STAGE_LABELS = {
   tiling: "Tiling",
@@ -95,23 +84,28 @@ export const STAGE_LABELS = {
   assignment_test: "Cluster assignment (test)",
 };
 
-// Step state -> icon. The point (per app_v28.py) is that all 5 stages are
+// Step state -> icon. The point (per app_v28.py) is that all 6 stages are
 // visible at once with their state, not just whichever one is "current".
 export const STEP_ICON = {
-  done: "✅",
-  running: "\u{1F504}",
-  action: "\u{1F535}", // ready for you to start
-  attention: "\u{1F7E0}", // finished or stalled, needs a decision
-  failed: "❌",
-  blocked: "⚪", // can't start yet, an earlier step must finish
+  done: "[Done]",
+  running: "[Running]",
+  action: "[Ready]", // ready for you to start
+  attention: "[Needs attention]", // finished or stalled, needs a decision
+  failed: "[Failed]",
+  blocked: "[Waiting]", // can't start yet, an earlier step must finish
 };
 
 export const DELIVERABLE_ICON = {
-  ready: "✅",
-  running: "\u{1F504}",
-  interrupted: "\u{1F7E0}",
+  ready: "[Ready]",
+  running: "[Packaging]",
+  interrupted: "[Interrupted]",
 };
 
+// Must match IN_FLIGHT_SLURM_STATES in tile_server_v2_.py. It lacked
+// CONFIGURING (nodes allocated, prologue still running — squeue reports it
+// first now), so a job Slurm was starting read here as "did not finish" and got
+// a Retry button. Stages whose submit guard matters (ANORAK) also get the
+// server's own verdict in /status rather than trusting this copy.
 export const SLURM_IN_FLIGHT = new Set([
   "PENDING",
   "RUNNING",
@@ -119,6 +113,7 @@ export const SLURM_IN_FLIGHT = new Set([
   "RESIZING",
   "SUSPENDED",
   "COMPLETING",
+  "CONFIGURING",
 ]);
 
 // Port of _describe_job_params(stage, params): the one line that tells two
@@ -175,9 +170,15 @@ export function datasetOptionLabel(dataset) {
   return bits.join(" · ");
 }
 
+// An ANORAK run on its own (POST /anorak-runs).
+export function isAnorakRun(run) {
+  return run.status === "anorak_only" || run.run_kind === "anorak";
+}
+
 export function datasetRunLabel(run) {
   const state = String(run.slurm_state || run.status || "unknown").toLowerCase();
-  const bits = [`${RUN_STATE_ICONS[state] || "❔"} ${(run.submitted_at || "").slice(0, 16).replace("T", " ")}`];
+  const bits = [(run.submitted_at || "").slice(0, 16).replace("T", " ")];
+  bits.push(isAnorakRun(run) ? "ANORAK" : String(run.job_id || "").startsWith("nf:") ? "HPL" : "HPL (before the pipeline)");
   const total = run.total_slides;
   if (total != null) bits.push(`${fmtInt(total)} slides${run.is_subset ? " (subset)" : ""}`);
   if (run.resumed_from_submission_id) bits.push("resume");
@@ -206,7 +207,7 @@ export function fullPackagingScopeCaption(status) {
 // tried the subset option doesn't read as "packaging never touched".
 export function testPackagingNote(status) {
   if (!status.test_h5_job_id) return "";
-  if (status.test_h5_ready) return " · test subset: ✅ ready";
+  if (status.test_h5_ready) return " · test subset: ready";
   const state = status.test_h5_slurm_state;
   if (SLURM_IN_FLIGHT.has(state)) return ` · test subset: running (${state})`;
   return ` · test subset: ${state || "interrupted"}`;
@@ -229,9 +230,56 @@ export function displayStage(status) {
   return stage || "unknown";
 }
 
-// Port of _pipeline_steps(status): classifies all 5 stages at once from a
+// Port of _pipeline_steps(status): classifies all 6 stages at once from a
 // single /status response so the whole pipeline can be shown, not just
 // whichever stage happens to be "current".
+// Stages 1-4 of a pipeline run (POST /pipeline-runs) are one Nextflow run.
+// Port of _pipeline_stage_states in app_v28.py: "done" still means the
+// server's own validator accepted the stage's output; no stage has a button
+// of its own — the pipeline starts each once the one before has verified.
+export const PIPELINE_STAGES = ["tiling", "packaging", "extraction", "assignment"];
+const PIPELINE_STAGE_NAME = {
+  tiling: "tiling", packaging: "packaging", extraction: "feature extraction", assignment: "classification",
+};
+const PIPELINE_STAGE_READY = {
+  packaging: "h5_ready", extraction: "extraction_ready", assignment: "assignment_ready",
+};
+
+export function pipelineStageVerified(status, stage) {
+  const info = ((status.pipeline || {}).stages || {})[stage] || {};
+  if (stage === "tiling") return info.state === "COMPLETED" && Boolean(status.tiling_complete);
+  return Boolean(status[PIPELINE_STAGE_READY[stage]]);
+}
+
+export function pipelineStageStates(status, computed) {
+  const stages = (status.pipeline || {}).stages || {};
+  const out = [];
+  let previousDone = true;
+  PIPELINE_STAGES.forEach((stage, i) => {
+    const slurm = (stages[stage] || {}).state;
+    let result;
+    if (pipelineStageVerified(status, stage)) {
+      result = ["done", computed[i][1]];
+    } else if (slurm === "COMPLETED") {
+      // The task said done, the server's validator disagrees — never hidden.
+      result = ["attention", "pipeline marked it done, but the output fails validation"];
+    } else if (slurm === "RUNNING") {
+      result = ["running", "running in the pipeline"];
+    } else if (SLURM_IN_FLIGHT.has(slurm)) {
+      result = ["blocked", previousDone ? "queued in the pipeline" : `waits for ${PIPELINE_STAGE_NAME[PIPELINE_STAGES[i - 1]]}`];
+    } else if (slurm == null) {
+      result = ["attention", "can't reach Slurm — state unknown"];
+    } else if (previousDone) {
+      result = ["failed", `pipeline stopped here (${slurm})`];
+    } else {
+      result = ["blocked", "not reached"];
+    }
+    out.push(result);
+    previousDone = result[0] === "done";
+  });
+  return out;
+}
+
 export function pipelineSteps(status) {
   const stage = status.status;
   const total = status.total_slides;
@@ -356,6 +404,17 @@ export function pipelineSteps(status) {
         .join(", ");
     }
     registration = ["done", summary.slice(0, 70)];
+  } else if (SLURM_IN_FLIGHT.has(status.registration_slurm_state)) {
+    // A Slurm-backed write in flight. Without this the stage reads "ready to
+    // register" while a job is actively writing, which invites a second one —
+    // and Stage 5 writes identity rows for a whole cohort, so a second one is
+    // not a no-op.
+    registration = ["running", `running (${status.registration_slurm_state})`];
+  } else if (status.registration_job_id) {
+    // A job id with no in-flight state and no done flag: it ended without
+    // recording a commit. The step has to say so rather than offering to
+    // register, because the job's own log is the only place the refusal is.
+    registration = ["attention", "a job ended without committing"];
   } else if (status.registration_ready) {
     registration = ["action", "ready to register"];
   } else {
@@ -372,12 +431,58 @@ export function pipelineSteps(status) {
   if (status.kb_load_done) {
     const rows = status.kb_load_rows;
     kbLoad = ["done", rows != null ? `${fmtInt(rows)} tiles in the KB` : "loaded"];
+  } else if (SLURM_IN_FLIGHT.has(status.kb_load_slurm_state)) {
+    kbLoad = ["running", `running (${status.kb_load_slurm_state})`];
+  } else if (status.kb_load_job_id) {
+    kbLoad = ["attention", "a job ended without committing"];
   } else if (!status.assignment_ready) {
     kbLoad = ["blocked", "waiting on cluster classification"];
   } else if (!status.registration_done) {
     kbLoad = ["blocked", "waiting on registration"];
   } else {
     kbLoad = ["action", "ready to load"];
+  }
+
+  // --- 7. ANORAK growth-pattern grading -------------------------------------
+  // Not gated on anything Stages 1-6 produce: ANORAK does its own tiling at its
+  // own resolution and reads the raw slides, so it shares no artifact with
+  // them. What it needs from them is the *slide list* — the cohort's tumour
+  // slides, which come from the cluster composition Stage 6 loads. So this is
+  // "action" as soon as there is something to grade, and the summary names
+  // which list it is about to use rather than assuming one.
+  let anorak;
+  if (status.anorak_ready) {
+    const scope = status.anorak_scope;
+    const slides = status.anorak_slides;
+    let detail = slides ? `${fmtInt(slides)} slides` : "complete";
+    if (scope === "subset") detail += ` (random subset, seed ${status.anorak_seed})`;
+    anorak = ["done", `growth patterns graded · ${detail}`];
+  } else if (status.anorak_in_flight || SLURM_IN_FLIGHT.has(status.anorak_slurm_state)) {
+    // The head job being alive is all this says. It submits a job per slide
+    // per stage itself, so its own state carries no progress.
+    anorak = ["running", `pipeline running (${status.anorak_slurm_state})`];
+  } else if (status.anorak_job_id && status.anorak_state_unknown) {
+    // Not "did not finish": Slurm could not be asked, so the head job may well
+    // be alive — and the server refuses a new submission until it can.
+    anorak = ["attention", "state unknown — Slurm unreachable"];
+  } else if (status.anorak_job_id) {
+    if (status.anorak_invalid_reason) {
+      anorak = ["attention", "finished without a usable grading table"];
+    } else {
+      anorak = ["attention", `did not finish (${status.anorak_slurm_state || "no Slurm record"})`];
+    }
+  } else if (status.kb_load_done) {
+    anorak = ["action", "ready to run"];
+  } else {
+    // Deliberately not "blocked": a slide list chosen some other way is a
+    // perfectly good input, and blocking would hide the form that takes one.
+    anorak = ["action", "ready to run (needs a tumour-slide list)"];
+  }
+
+  if (status.pipeline) {
+    [tiling, packaging, extraction, assignment] = pipelineStageStates(status, [
+      tiling, packaging, extraction, assignment,
+    ]);
   }
 
   return [
@@ -387,6 +492,7 @@ export function pipelineSteps(status) {
     { key: "assignment", title: "4. Cluster classification", state: assignment[0], summary: assignment[1] },
     { key: "registration", title: "5. Register in the Knowledge Bank", state: registration[0], summary: registration[1] },
     { key: "kb_load", title: "6. Knowledge Bank load", state: kbLoad[0], summary: kbLoad[1] },
+    { key: "anorak", title: "7. Growth patterns (ANORAK)", state: anorak[0], summary: anorak[1] },
   ];
 }
 

@@ -226,6 +226,49 @@ def test_the_status_payload_carries_what_the_stepper_gates_on(_tmp=None):
         assert f'base["{flag}"]' in server, f"/status never sets {flag}"
 
 
+# --- a KB write running on Slurm ------------------------------------------
+#
+# Stages 5 and 6 can now be handed to Slurm so the write outlives the server.
+# That gives each of them a state they never had: submitted, not yet committed.
+# Reading it as "ready to register" is how a cohort gets registered twice.
+
+
+def test_a_queued_registration_reads_as_running_not_as_ready(_tmp=None):
+    steps = _by_key(_pipeline_steps()(_finished_through_assignment(
+        registration_job_id="987654", registration_slurm_state="PENDING")))
+
+    assert steps["registration"]["state"] == "running"
+    assert "PENDING" in steps["registration"]["summary"]
+
+
+def test_a_queued_kb_load_reads_as_running_not_as_ready(_tmp=None):
+    steps = _by_key(_pipeline_steps()(_finished_through_assignment(
+        registration_done=True,
+        kb_load_job_id="987655", kb_load_slurm_state="RUNNING")))
+
+    assert steps["kb_load"]["state"] == "running"
+
+
+def test_a_job_that_ended_without_committing_asks_for_attention(_tmp=None):
+    """Not "done" — the job set neither flag — and not "ready", which would hide
+    a failed write behind a button that looks like it was never pressed."""
+    steps = _by_key(_pipeline_steps()(_finished_through_assignment(
+        registration_job_id="987654", registration_slurm_state="FAILED")))
+
+    assert steps["registration"]["state"] == "attention"
+
+
+def test_a_committed_job_still_reads_as_done(_tmp=None):
+    """The job sets registration_done itself, so "done" keeps meaning committed
+    however the write ran."""
+    steps = _by_key(_pipeline_steps()(_finished_through_assignment(
+        registration_done=True, registration_rows={"tile_registry": 38892},
+        registration_job_id="987654", registration_slurm_state="COMPLETED")))
+
+    assert steps["registration"]["state"] == "done"
+    assert "38,892" in steps["registration"]["summary"]
+
+
 # --- standalone runner ---------------------------------------------------
 
 def main():

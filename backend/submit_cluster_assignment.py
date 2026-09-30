@@ -40,13 +40,17 @@ import sys
 from pathlib import Path
 
 import h5py
+import numpy as np
 
 from submit_feature_extraction import (
+    CONTAINER_EXTRAS_GPU,
     CONTAINER_EXTRAS,
     shard_ranges,
     MERGE_PARTITION,
     SINGULARITY_BIN,
     SINGULARITY_IMAGE,
+    bootstrap_container_extras,
+    _CONTAINER_EXTRA_PACKAGES_GPU,
     _bind_args,
     _check_container_extras,
     _check_singularity_image,
@@ -176,6 +180,12 @@ def check_reference(reference: Path) -> dict:
                 "reference_path": str(reference),
                 "reference_rows": int(npz["reference"].shape[0]),
                 "reference_dims": int(npz["reference"].shape[1]),
+                # The PCA basis is (input dims, components), so this is the
+                # width of a raw embedding — 128 where reference_dims is 127.
+                # A query mean is subtracted from raw embeddings *before*
+                # projection, so it is this number a mean must match, not the
+                # component count.
+                "embedding_dims": int(npz["components"].shape[0]),
                 "n_clusters": int(len(npz["categories"])),
                 "groupby": meta.get("groupby"),
                 "k": int(npz["n_neighbors"]),
@@ -408,6 +418,184 @@ def vote_flags(
     return flags
 
 
+def parse_slurm_walltime(value: str) -> int | None:
+    """Slurm walltime to seconds. None means unlimited.
+
+    Accepts the forms both sides of this use: "4-00:00:00" from our own
+    constants, "2-00:00:00" / "12:00:00" / "infinite" from `sinfo -o %l`, and
+    "MM:SS" for completeness.
+    """
+    text = (value or "").strip().lower()
+    if not text or text in ("infinite", "unlimited", "n/a"):
+        return None
+    days, _, clock = text.partition("-")
+    if not clock:
+        days, clock = "0", days
+    parts = [int(p) for p in clock.split(":")]
+    if len(parts) == 3:
+        hours, minutes, seconds = parts
+    elif len(parts) == 2:
+        hours, minutes, seconds = 0, parts[0], parts[1]
+    elif len(parts) == 1:
+        hours, minutes, seconds = 0, parts[0], 0
+    else:
+        raise ValueError(f"Unrecognised Slurm walltime: {value!r}")
+    return int(days) * 86400 + hours * 3600 + minutes * 60 + seconds
+
+
+def partition_time_limit(partition: str) -> int | None:
+    """The partition's own maximum walltime in seconds, or None if unknown.
+
+    None for "could not ask" as well as for "unlimited", deliberately: this is
+    used to produce a better error message, never to refuse on its own, so a
+    cluster where sinfo is unavailable must not lose the ability to submit.
+    """
+    try:
+        result = subprocess.run(["sinfo", "-h", "-p", partition, "-o", "%l"],
+                                capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    limits = []
+    for line in (result.stdout or "").splitlines():
+        try:
+            seconds = parse_slurm_walltime(line)
+        except ValueError:
+            continue
+        if seconds is None:
+            return None                      # an unlimited row caps nothing
+        limits.append(seconds)
+    return max(limits) if limits else None
+
+
+def check_time_limit(partition: str, requested: str) -> None:
+    """Refuse a walltime the partition cannot grant, before sbatch does.
+
+    sbatch's own refusal — "Requested time limit is invalid (missing or exceeds
+    some limit)" — is correct and nearly useless: it names neither the limit nor
+    the value, and it arrives at the bottom of a traceback holding a
+    3,000-character --wrap string. It also arrives *after* the mean job has been
+    submitted, leaving an orphan queued against a dependency that will never
+    exist.
+
+    The 4-day default was set for the GPU partition, which allows five. `compute`
+    allows two, so submitting a CPU run with the defaults always failed here.
+    """
+    limit = partition_time_limit(partition)
+    if limit is None:
+        return
+    try:
+        wanted = parse_slurm_walltime(requested)
+    except ValueError as e:
+        raise ValueError(str(e)) from e
+    if wanted is None or wanted <= limit:
+        return
+    raise ValueError(
+        f"--time-limit {requested} exceeds partition {partition!r}'s maximum of "
+        f"{limit // 86400}-{limit % 86400 // 3600:02d}:"
+        f"{limit % 3600 // 60:02d}:{limit % 60:02d}. sbatch would refuse this "
+        f"after the mean job had already been queued. Pass a shorter "
+        f"--time-limit — a 32-shard assignment is hours per shard, so "
+        f"1-00:00:00 is ample — or submit to a partition with a longer limit."
+    )
+
+
+def jobs_in_flight_named(job_name: str) -> list[str]:
+    """Ids of this user's queued or running jobs whose name starts with
+    job_name. Empty when squeue cannot be reached — see refuse_if_already_queued.
+    """
+    try:
+        result = subprocess.run(
+            ["squeue", "-h", "-u", os.environ.get("USER", ""), "-o", "%i|%j"],
+            capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if result.returncode != 0:
+        return []
+    found = []
+    for line in (result.stdout or "").splitlines():
+        job_id, _, name = line.partition("|")
+        # The mean and merge steps are named <job_name>_mean / _merge, so a
+        # prefix match catches a whole pipeline rather than only its array.
+        if name.strip().startswith(job_name):
+            found.append(job_id.strip())
+    return found
+
+
+def refuse_if_already_queued(job_name: str, *, force: bool = False) -> None:
+    """Refuse a second identical pipeline while the first is still in flight.
+
+    Two runs of the same submission collide on every path they use: one
+    query_mean.npy, one set of 32 shard part files, one output CSV — and the
+    second pipeline's merge runs --cleanup, deleting parts the first one's tasks
+    are still writing. Two processes writing one part file is the shape of
+    failure this codebase is written against: the row count can come out right
+    while the contents interleave.
+
+    A retype of the same command is how this happens, so the guard is on the job
+    name rather than on any flag. squeue being unreachable is not a refusal:
+    this prevents an accident, and must not become a new way to be blocked.
+    """
+    if force:
+        return
+    existing = jobs_in_flight_named(job_name)
+    if not existing:
+        return
+    raise ValueError(
+        f"{len(existing)} job(s) named {job_name!r} are already queued or "
+        f"running: {', '.join(existing)}. A second pipeline would write the "
+        f"same query_mean.npy, the same shard parts and the same output CSV, "
+        f"and its merge would delete parts the first one is still writing.\n\n"
+        f"Cancel those first (scancel {' '.join(existing)}), or pass "
+        f"--force-duplicate if you genuinely intend two runs — in which case "
+        f"give the second one a different --out."
+    )
+
+
+def partition_has_gpus(partition: str) -> bool | None:
+    """Whether the partition advertises any generic resources (GPUs).
+
+    None means "could not ask", which never blocks a submission — same posture
+    as partition_time_limit.
+    """
+    try:
+        result = subprocess.run(["sinfo", "-h", "-p", partition, "-o", "%G"],
+                                capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    lines = [l.strip() for l in (result.stdout or "").splitlines() if l.strip()]
+    if not lines:
+        return None
+    return any(l not in ("(null)", "N/A") for l in lines)
+
+
+def resolve_device(device: str, extras_gpu: Path = CONTAINER_EXTRAS_GPU) -> tuple[str, str]:
+    """(device, why) for a submission. "auto" is decided here, not in the job.
+
+    The job's own "auto" can look at the GPU in front of it; a submission cannot,
+    because the sbatch flags — --nv, --gres, which extras directory to bind —
+    have to be chosen before any node is allocated. The observable that decides
+    it is whether the GPU extras have been bootstrapped: without them the
+    container has faiss-cpu and nothing else, so asking Slurm for a GPU would
+    queue behind every real GPU job to run a CPU search.
+
+    Reported rather than silent, because "why is this on the CPU partition" is a
+    question the answer should already be on screen for.
+    """
+    if device not in ("auto", "cpu", "gpu"):
+        raise ValueError(f"Unknown device: {device!r}. Use 'auto', 'cpu' or 'gpu'.")
+    if device != "auto":
+        return device, "requested explicitly"
+    if extras_gpu.is_dir() and (extras_gpu / "faiss").is_dir():
+        return "gpu", f"GPU extras present at {extras_gpu}"
+    return "cpu", (f"no GPU faiss at {extras_gpu} — run "
+                   f"`submit_feature_extraction.py --bootstrap-extras-gpu` to "
+                   f"use one")
+
+
 def _build_assignment_command(
     *,
     singularity_bin: str,
@@ -424,11 +612,22 @@ def _build_assignment_command(
     query_mean: Path | None = None,
     shard_bounds: list[tuple[int, int]] | None = None,
     vote: list[str] | None = None,
+    threads: int = 1,
+    device: str = "cpu",
+    row_range: tuple[int, int] | None = None,
 ) -> str:
     """Shell command the Slurm --wrap runs.
 
-    No --nv: this is CPU work, and requesting the GPU runtime for it would put
-    the job behind every GPU job in the queue for no benefit.
+    shard_bounds is for a Slurm array (each task picks its range by
+    SLURM_ARRAY_TASK_ID); row_range is one fixed range, for a caller that runs
+    every shard as its own job with no array index — the Nextflow pipeline.
+    Both reach the container by the same SINGULARITYENV_ route.
+
+    --nv only for device="gpu". The search is CPU work by default, and asking
+    for the GPU runtime then would queue the job behind every real GPU job for
+    no benefit. With device="gpu" it is the opposite: without --nv the container
+    sees no driver, and faiss would refuse at startup (Searcher verifies the GPU
+    index against the CPU one rather than falling back silently).
     """
     paths = [assign_script.parent, reference.parent, projections_h5, out_csv.parent,
              singularity_image, extras_dir]
@@ -446,6 +645,7 @@ def _build_assignment_command(
         # Progress every N tiles, so a long run is visibly alive in the log
         # rather than silent until it finishes.
         "--progress 50000",
+        f"--device {device}",
     ]
     if k is not None:
         args.append(f"--k {k}")
@@ -460,38 +660,95 @@ def _build_assignment_command(
     # well-formed CSV of different cluster IDs. assign_hpc_clusters.py refuses
     # the combination outright, so this is belt and braces on a guard that
     # already exists.
-    shard_preamble = ""
+    # The shard bounds are resolved OUTSIDE the container and handed in through
+    # the environment, because SLURM_ARRAY_TASK_ID is one more thing
+    # `singularity exec --cleanenv` wipes — the same mechanism that silently
+    # pinned every assignment to one core, except here it is not silent: under
+    # `set -u` the array index aborts the task the instant the import check
+    # finishes, the whole array dies, and the merge is left on
+    # DependencyNeverSatisfied with no clue in the log beyond where it stops.
+    #
+    # SINGULARITYENV_/APPTAINERENV_ are the documented way through --cleanenv,
+    # and both prefixes are set because the binary may be either.
+    outer_preamble = ""
+    env_parts: list[str] = []
+    if device == "gpu":
+        # Slurm tells each task which physical GPU is its own through
+        # CUDA_VISIBLE_DEVICES, and --cleanenv deletes it like everything else.
+        # Without this, every task on a node sees all the cards and
+        # index_cpu_to_gpu(res, 0, ...) puts them all on GPU 0: N shards
+        # contending for one device while the rest idle, at no point failing.
+        # Third instance of this class, after the thread count and the array
+        # index.
+        #
+        # ":-0" so a hand-run job outside Slurm still works, where the variable
+        # is legitimately unset and device 0 is the only sensible default.
+        env_parts += [
+            'SINGULARITYENV_CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"',
+            'APPTAINERENV_CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"',
+        ]
     if query_mean is not None:
         args.append(f"--query-mean {shlex.quote(real(query_mean))}")
-    if shard_bounds is not None:
+    if shard_bounds is not None and row_range is not None:
+        raise ValueError("Pass shard_bounds (a Slurm array) or row_range (one "
+                         "fixed range), not both.")
+    if row_range is not None:
+        lo, hi = (int(v) for v in row_range)
+        outer_preamble = (
+            "set -euo pipefail; "
+            f"ROW_START={lo}; ROW_STOP={hi}; "
+            'echo "=== Rows $ROW_START-$ROW_STOP ==="; '
+        )
+    elif shard_bounds is not None:
         starts = " ".join(str(lo) for lo, _ in shard_bounds)
         stops = " ".join(str(hi) for _, hi in shard_bounds)
-        shard_preamble = (
+        outer_preamble = (
+            "set -euo pipefail; "
             f"SHARD_STARTS=({starts}); SHARD_STOPS=({stops}); "
+            # Still `set -u` on the index, which is the check worth keeping: an
+            # unset SLURM_ARRAY_TASK_ID out here means a sharded command really
+            # was submitted as a plain job, and one task silently encoding the
+            # wrong range is worse than a refusal.
             'ROW_START="${SHARD_STARTS[$SLURM_ARRAY_TASK_ID]}"; '
             'ROW_STOP="${SHARD_STOPS[$SLURM_ARRAY_TASK_ID]}"; '
             'echo "=== Shard $SLURM_ARRAY_TASK_ID: rows $ROW_START-$ROW_STOP ==="; '
         )
-        args.append("--row-start $ROW_START --row-stop $ROW_STOP")
+    if shard_bounds is not None or row_range is not None:
+        env_parts += [
+            'SINGULARITYENV_ROW_START="$ROW_START"',
+            'SINGULARITYENV_ROW_STOP="$ROW_STOP"',
+            'APPTAINERENV_ROW_START="$ROW_START"',
+            'APPTAINERENV_ROW_STOP="$ROW_STOP"',
+        ]
+        args.append('--row-start "$ROW_START" --row-stop "$ROW_STOP"')
 
     inner = (
         "set -euo pipefail; "
         f"export PYTHONPATH={shlex.quote(real(extras_dir))}${{PYTHONPATH:+:$PYTHONPATH}}; "
         'export MPLCONFIGDIR="${TMPDIR:-/tmp}/mplconfig-$$"; mkdir -p "$MPLCONFIGDIR"; '
-        # Single-threaded BLAS. faiss and numpy both spawn threads sized to the
-        # machine, not to the cpuset Slurm gave us, and oversubscribing a
-        # shared node is slower than the serial path as well as antisocial.
-        'export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-1}"; '
+        # Thread count baked in at submit time rather than read from
+        # SLURM_CPUS_PER_TASK here. This string is expanded INSIDE the
+        # container, and `singularity exec --cleanenv` has already wiped the
+        # environment by then, so the Slurm variable does not exist and the
+        # fallback silently won: every assignment ran on one core. A 2.5M-row
+        # reference at 127 dims came to 49 tiles/s, which is ~31 GFLOP/s — a
+        # single core's fp32 rate — turning a few hours into three days.
+        #
+        # Still pinned rather than left to faiss, which sizes its pool to the
+        # machine rather than to the cpuset Slurm gave us; oversubscribing a
+        # shared node is slower than running serially, as well as antisocial.
+        f"export OMP_NUM_THREADS={int(threads)}; "
         'export OPENBLAS_NUM_THREADS="$OMP_NUM_THREADS"; '
         'export MKL_NUM_THREADS="$OMP_NUM_THREADS"; '
         "echo '=== Container packages ==='; "
         f"python -c {shlex.quote(_import_check_python(real(reference)))}; "
-        f"{shard_preamble}"
-        "echo '=== Cluster assignment ==='; "
+        f"echo '=== Cluster assignment ({device}) ==='; "
         f"python {shlex.quote(real(assign_script))} {' '.join(args)}"
     )
-    return " ".join([
-        shlex.quote(singularity_bin), "exec", "--cleanenv", *binds,
+    env_prefix = (" ".join(env_parts) + " ") if env_parts else ""
+    return outer_preamble + env_prefix + " ".join([
+        shlex.quote(singularity_bin), "exec", "--cleanenv",
+        *(["--nv"] if device == "gpu" else []), *binds,
         shlex.quote(str(singularity_image)), "bash", "-lc", shlex.quote(inner),
     ])
 
@@ -505,6 +762,7 @@ def _build_simple_command(
     args: list[str],
     extra_binds: list[Path],
     banner: str,
+    threads: int = 1,
 ) -> str:
     """One-liner container invocation, shared by the mean and merge jobs.
 
@@ -516,7 +774,10 @@ def _build_simple_command(
     inner = (
         "set -euo pipefail; "
         f"export PYTHONPATH={shlex.quote(real(extras_dir))}${{PYTHONPATH:+:$PYTHONPATH}}; "
-        'export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-1}"; '
+        # See _build_assignment_command: --cleanenv means SLURM_CPUS_PER_TASK
+        # is not readable from in here.
+        f"export OMP_NUM_THREADS={int(threads)}; "
+        'export OPENBLAS_NUM_THREADS="$OMP_NUM_THREADS"; '
         f"echo '=== {banner} ==='; "
         f"python {shlex.quote(real(script))} {' '.join(args)}"
     )
@@ -564,8 +825,11 @@ def submit_cluster_assignment_job(
     notify_email: str | None = None,
     singularity_image: Path = SINGULARITY_IMAGE,
     singularity_bin: str = SINGULARITY_BIN,
-    extras_dir: Path = CONTAINER_EXTRAS,
+    extras_dir: Path | None = None,
+    device: str = "auto",
     overwrite: bool = False,
+    force_duplicate: bool = False,
+    query_mean: Path | None = None,
 ) -> dict:
     """Submit Stage 3 for one projections file.
 
@@ -611,7 +875,30 @@ def submit_cluster_assignment_job(
         )
 
     _check_singularity_image(singularity_image, singularity_bin)
+    device, device_reason = resolve_device(device)
+    print(f"Device:           {device}  ({device_reason})")
+    if device == "gpu":
+        # A --gres=gpu:1 on a partition with no GPUs pends forever as
+        # ReqNodeNotAvail, which reads like a busy queue rather than a
+        # misconfiguration. Refuse instead, at submit time.
+        has_gpus = partition_has_gpus(partition)
+        if has_gpus is False:
+            raise ValueError(
+                f"--device gpu asks Slurm for a GPU, but partition "
+                f"{partition!r} advertises none, so the job would pend "
+                f"indefinitely as ReqNodeNotAvail. Submit to a GPU partition "
+                f"(--partition), or use --device cpu. Note a GPU partition is "
+                f"preemptible here, so pair it with --shards."
+            )
+    # The GPU search reads a different extras directory, because faiss-cpu and
+    # a GPU faiss are both imported as `faiss` and cannot share a PYTHONPATH.
+    if extras_dir is None:
+        extras_dir = CONTAINER_EXTRAS_GPU if device == "gpu" else CONTAINER_EXTRAS
     _check_container_extras(extras_dir, singularity_image, singularity_bin)
+    # Before the mean job, so a bad walltime does not leave an orphan queued
+    # against a dependency that never appears.
+    check_time_limit(partition, time_limit)
+    refuse_if_already_queued(job_name, force=force_duplicate)
 
     if shards > 1 and depends_on_job_id is not None:
         # The array size has to be known at sbatch time, and it comes from the
@@ -645,7 +932,48 @@ def submit_cluster_assignment_job(
         shard_bounds = shard_ranges(rows, shards)
         mean_path = out_csv.with_name(f"{out_csv.stem}.query_mean.npy")
 
-        if centering == "query":
+        if centering == "query" and query_mean is not None:
+            # An already-computed mean, so no mean job and no dependency. The
+            # step is one streamed pass over the projections and needs neither
+            # faiss nor the container — `assign_hpc_clusters.py
+            # --precompute-mean` runs it anywhere — so a mean job that will not
+            # start should not hold up an array, and a retry should not repeat a
+            # pass it already has.
+            #
+            # Validated here rather than trusted: every shard centres on this
+            # file, so a truncated or wrong-width one produces 32 well-formed
+            # CSVs of wrong cluster IDs, which is the failure mode with no
+            # downstream check.
+            mean_path = Path(query_mean)
+            if not mean_path.is_file():
+                raise FileNotFoundError(f"No such query-mean file: {mean_path}")
+            try:
+                loaded = np.load(mean_path)
+            except Exception as e:  # noqa: BLE001
+                raise ValueError(f"{mean_path} is not a readable .npy: {e}") from e
+            # The raw-embedding width, not the component count. project()
+            # subtracts this mean from the embeddings and *then* multiplies by
+            # the (input dims, components) basis, so a correct mean for a
+            # 2.5M x 127 reference is 128 wide. Checking against 127 rejected
+            # the right file.
+            expected = int(reference_info["embedding_dims"])
+            if loaded.shape != (expected,):
+                raise ValueError(
+                    f"{mean_path} holds shape {loaded.shape}, but this "
+                    f"reference's PCA basis takes {expected}-dimensional "
+                    f"embeddings (and produces "
+                    f"{reference_info['reference_dims']} components). A query "
+                    f"mean is subtracted from raw embeddings before projection, "
+                    f"so it must be {expected} wide. A mean of the wrong width "
+                    f"projects every tile into a different space and produces a "
+                    f"complete CSV of wrong cluster IDs."
+                )
+            if not np.isfinite(loaded).all():
+                raise ValueError(
+                    f"{mean_path} contains non-finite values — it was probably "
+                    f"written by an interrupted job. Delete it and recompute.")
+            print(f"Query mean:       {mean_path} (reused, {expected}-d embeddings)")
+        elif centering == "query":
             mean_command = _build_simple_command(
                 singularity_bin=singularity_bin, singularity_image=singularity_image,
                 extras_dir=extras_dir, script=backend_dir / ASSIGN_SCRIPT,
@@ -657,6 +985,10 @@ def submit_cluster_assignment_job(
                 ],
                 extra_binds=[projections_h5, reference.parent, out_csv.parent],
                 banner="Query mean",
+                # Matches --cpus-per-task=4 on the mean sbatch below. The two
+                # numbers have to be written together: the container cannot
+                # read the Slurm one.
+                threads=4,
             )
             mean_sbatch = [
                 "sbatch", f"--job-name={job_name}_mean",
@@ -701,6 +1033,8 @@ def submit_cluster_assignment_job(
         validate_against=validate_against,
         query_mean=mean_path,
         shard_bounds=shard_bounds,
+        threads=cpus,
+        device=device,
     )
 
     sbatch_command = [
@@ -710,14 +1044,24 @@ def submit_cluster_assignment_job(
         f"--cpus-per-task={cpus}",
         f"--mem={memory}",
         f"--time={time_limit}",
+        # One device per task. The search holds the whole reference in device
+        # memory — 2.5M x 127 float32 is about 1.3 GB, so any of this cluster's
+        # cards is ample — and a shard array asks for one each.
+        *(["--gres=gpu:1"] if device == "gpu" else []),
         *([f"--array=0-{shards - 1}"] if shard_bounds else []),
         # afterok on the mean job when sharding: a shard that ran before the mean
         # file existed would fail on a missing --query-mean, and one that somehow
         # read a stale mean would silently disagree with its siblings.
         *([f"--dependency=afterok:{mean_job_id or depends_on_job_id}"]
           if (mean_job_id or depends_on_job_id) else []),
-        f"--output={log_dir}/hpl_assign_%j.out",
-        f"--error={log_dir}/hpl_assign_%j.err",
+        # %A_%a for an array, %j otherwise. %j in an array task expands to that
+        # task's OWN JobId — a number that appears nowhere in `squeue`, which
+        # shows 1241672_0 — so the logs existed under names nobody could
+        # predict, and every attempt to tail a shard's log hit "no such file".
+        *([f"--output={log_dir}/hpl_assign_%A_%a.out",
+           f"--error={log_dir}/hpl_assign_%A_%a.err"] if shard_bounds else
+          [f"--output={log_dir}/hpl_assign_%j.out",
+           f"--error={log_dir}/hpl_assign_%j.err"]),
         f"--chdir={backend_dir}",
         *([f"--mail-user={notify_email}", "--mail-type=END,FAIL"] if notify_email else []),
         "--wrap", f"bash -lc {shlex.quote(command)}",
@@ -775,6 +1119,7 @@ def submit_cluster_assignment_job(
             ],
             extra_binds=[out_csv.parent],
             banner="Merging shards",
+            threads=2,          # matches --cpus-per-task=2 below
         )
         merge_sbatch = [
             "sbatch", f"--job-name={job_name}_merge",
@@ -868,7 +1213,9 @@ def build_parser() -> argparse.ArgumentParser:
                              f"prefer headroom. Not checked against the partition's "
                              f"MaxTime here: sbatch rejects it, or leaves the job "
                              f"pending with reason PartitionTimeLimit. Check with "
-                             f"`sinfo -o \"%P %l\"` before raising it.")
+                             # %% because argparse %-interpolates help text: a literal
+                             # "%P" made --help itself raise ValueError.
+                             f"`sinfo -o \"%%P %%l\"` before raising it.")
     parser.add_argument("--mean-time-limit", type=str, default=MEAN_TIME_LIMIT,
                         help=f"Walltime for the shared query-mean job, submitted "
                              f"only when sharding with --centering query. Default "
@@ -877,6 +1224,20 @@ def build_parser() -> argparse.ArgumentParser:
                         help=f"Walltime for the shard-merge job. Default "
                              f"{MERGE_TIME_LIMIT}.")
     parser.add_argument("--notify-email", type=str, default=None)
+    parser.add_argument("--device", default="auto",
+                        choices=["auto", "cpu", "gpu"],
+                        help="Where the exact flat search runs. GPU is the same "
+                             "exhaustive scan on faster hardware, not an "
+                             "approximation, and the job verifies its GPU index "
+                             "against a CPU one at startup rather than trusting "
+                             "it. auto (default) uses a GPU when the GPU extras "
+                             "have been bootstrapped and CPU otherwise, printing "
+                             "which and why; gpu requests one and refuses if the "
+                             "partition has none; cpu never asks. A GPU means a "
+                             "GPU partition, which is preemptible here, so pair "
+                             "it with --shards — a shard is the checkpoint that "
+                             "makes a preemption cost one task rather than the "
+                             "run.")
     parser.add_argument("--shards", type=int, default=1,
                         help="Split the assignment across N array tasks. A mean job "
                              "runs first so every shard centres identically, then a "
@@ -885,11 +1246,69 @@ def build_parser() -> argparse.ArgumentParser:
                         choices=["query", "reference", "none"])
     parser.add_argument("--overwrite", action="store_true",
                         help="Replace an existing output CSV.")
+    parser.add_argument("--bootstrap-gpu-faiss", action="store_true",
+                        help="Install a GPU faiss into the GPU extras directory "
+                             "and exit, so --device gpu has something to use. "
+                             "One-time, on a login node (needs PyPI access). "
+                             "This installs a package for THIS stage: it runs "
+                             "no feature extraction and no GPU job. The same "
+                             "flag exists on submit_feature_extraction.py only "
+                             "because that file owns the container's package "
+                             "list.")
+    parser.add_argument("--query-mean", type=Path, default=None,
+                        help="Reuse an existing query-mean .npy instead of "
+                             "submitting the mean job. Compute one with "
+                             "`assign_hpc_clusters.py --precompute-mean <path>`, "
+                             "which needs no container and no faiss. Its width "
+                             "is checked against the reference before anything "
+                             "is queued.")
+    parser.add_argument("--force-duplicate", action="store_true",
+                        help="Submit even though a pipeline with this job name "
+                             "is already queued or running. Only with a "
+                             "different --out: two runs sharing an output path "
+                             "overwrite each other's shard parts.")
     return parser
 
 
 def main() -> None:
     args = build_parser().parse_args()
+
+    if args.bootstrap_gpu_faiss:
+        # Candidates one at a time: given three names pip installs whichever it
+        # resolves first and reports success, hiding which one landed — and that
+        # decides whether the job has a usable GPU faiss at all.
+        errors = []
+        for package in _CONTAINER_EXTRA_PACKAGES_GPU:
+            print(f"\nTrying {package} ...", flush=True)
+            try:
+                bootstrap_container_extras(
+                    CONTAINER_EXTRAS_GPU,
+                    singularity_image=args.singularity_image
+                    if hasattr(args, "singularity_image") else SINGULARITY_IMAGE,
+                    singularity_bin=args.singularity_bin
+                    if hasattr(args, "singularity_bin") else SINGULARITY_BIN,
+                    packages=(package,),
+                    verify="faiss",
+                )
+            except (FileNotFoundError, RuntimeError) as e:
+                errors.append(f"{package}: {e}")
+                print(f"  {package} did not install: {e}", file=sys.stderr)
+                continue
+            print(f"\nGPU faiss installed from {package} into "
+                  f"{CONTAINER_EXTRAS_GPU}.")
+            print("--device now resolves to gpu on its own. The job verifies the "
+                  "GPU index against a CPU one at startup and refuses if they "
+                  "disagree, so a wheel that imports but does not work costs a "
+                  "refusal rather than wrong cluster IDs.")
+            raise SystemExit(0)
+        print("\nNo GPU faiss wheel installed for this container's Python:",
+              file=sys.stderr)
+        for line in errors:
+            print(f"  {line}", file=sys.stderr)
+        print("This stage still runs on CPU; --shards is the CPU-side lever and "
+              "needs nothing installed.", file=sys.stderr)
+        raise SystemExit(1)
+
     try:
         info = submit_cluster_assignment_job(
             projections_h5=args.projections_h5,
@@ -901,6 +1320,9 @@ def main() -> None:
             batch_size=args.batch_size,
             validate_against=args.validate_against,
             shards=args.shards,
+            device=args.device,
+            force_duplicate=args.force_duplicate,
+            query_mean=args.query_mean,
             centering=args.centering,
             vote_preset=args.vote_preset,
             distance_weighted=args.distance_weighted,
@@ -919,6 +1341,11 @@ def main() -> None:
             overwrite=args.overwrite,
         )
     except (FileNotFoundError, FileExistsError, ValueError, KeyError) as e:
+        print(f"Not submitted: {e}", file=sys.stderr)
+        raise SystemExit(1)
+    except RuntimeError as e:
+        # sbatch refused. The reason is already extracted; a traceback here just
+        # buries it under the whole --wrap string.
         print(f"Not submitted: {e}", file=sys.stderr)
         raise SystemExit(1)
 

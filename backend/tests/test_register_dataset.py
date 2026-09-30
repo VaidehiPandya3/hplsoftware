@@ -146,15 +146,58 @@ def test_slide_with_no_metadata_is_reported_not_dropped_silently(tmp_path):
     assert any("OTHER SLIDE" in m for m in plan["missing_slides"])
 
 
-def test_legacy_h5_is_refused_with_the_migration_command(tmp_path):
+def test_legacy_h5_has_the_suffix_appended_rather_than_being_refused(tmp_path):
+    """A .h5 packaged before the tile-name fix used to be refused here and sent
+    to migrate_tile_names.py. The mapping "24_10" -> "24_10.jpeg" is total and
+    lossless (auto_tile_from_mask.py writes nothing else), so it is applied on
+    the way in — and counted, because a silent correction to identity is the
+    thing this codebase is written against."""
     h5_path = tmp_path / "legacy.h5"
     _write_h5(h5_path, [("S1", SLIDE, "24_10")])  # no suffix
+
+    frame = rd.read_h5_identity(h5_path)
+
+    assert frame["tiles"].tolist() == ["24_10.jpeg"]
+    assert frame["slide_tile"].tolist() == [f"{SLIDE.upper()}_24_10.JPEG"]
+    assert frame.attrs["tile_names_normalized"] == 1
+
+
+def test_a_half_migrated_h5_is_still_refused(tmp_path):
+    """Mixed is the one state that cannot be repaired: the rows on either side
+    of a resume that straddled the fix are indistinguishable by name, so
+    appending would attach real cluster IDs to the wrong tiles. Note the old
+    guard could not even see this case — tiles_missing_suffix() samples and
+    requires ALL names to be short — so this is a refusal that did not exist."""
+    h5_path = tmp_path / "half.h5"
+    _write_h5(h5_path, [("S1", SLIDE, "24_10"), ("S1", SLIDE, "25_10.jpeg")])
     try:
         rd.read_h5_identity(h5_path)
     except SystemExit as e:
-        assert "migrate_tile_names.py" in str(e), str(e)
+        assert "Repackage" in str(e), str(e)
     else:
-        raise AssertionError("legacy tile names must be refused")
+        raise AssertionError("a half-migrated .h5 must be refused")
+
+
+def test_short_stage1_metadata_still_joins_the_normalised_h5(tmp_path):
+    """Both sides have to be normalised or neither. Fixing only the .h5 turns
+    the old loud refusal into tiles_with_coordinates: 0 — the same bug, now
+    silent and shaped exactly like a successful registration."""
+    h5_path = tmp_path / "legacy.h5"
+    _write_h5(h5_path, [("S1", SLIDE, "24_10")])
+    tile_dir = tmp_path / "tiles"
+    _write_metadata(tile_dir, "Radiogenomics", SLIDE, [(24, 10)])
+    # Rewrite Stage 1's CSV into the pre-fix short form.
+    csv = tile_dir / "Radiogenomics" / SLIDE / f"{SLIDE}_tile_metadata.csv"
+    frame = pd.read_csv(csv)
+    frame["tiles"] = frame["tiles"].str.replace(".jpeg", "", regex=False)
+    frame["slide_tile"] = frame["slide_tile"].str.replace(".jpeg", "", regex=False)
+    frame.to_csv(csv, index=False)
+
+    plan = rd.build_registration(h5_path, tile_dir, "Radiogenomics", str(h5_path),
+                                 "RADIOGENOMICS")
+
+    assert len(plan["coordinates"]) == 1, "the short-named coordinates must still join"
+    assert plan["tile_names_normalized"] == {"h5": 1, "coordinates": 1}
 
 
 def test_first_registration_writes_both_tables_in_one_transaction(tmp_path):
@@ -606,6 +649,29 @@ def test_the_conflicting_sample_check_can_fail(tmp_path):
     assert plan["conflicting_samples"] == []
 
 
+def test_numeric_slide_ids_in_stage1_metadata_still_join_the_h5(tmp_path):
+    """Stage 1's CSV spells the slide the way the .h5 does, but pandas reads an
+    all-digit slides column as numbers: '007' comes back as 7, and 'NA' as NaN.
+    The coordinates' key is then '7_1_1.JPEG' against the .h5's '007_1_1.JPEG',
+    and registration reports tiles_with_coordinates: 0 for slides that were
+    tiled perfectly well."""
+    h5_path = tmp_path / "packaged.h5"
+    _write_h5(h5_path, [("S1", "007", "1_1.jpeg"), ("S2", "NA", "2_2.jpeg"),
+                        ("S3", "1001", "3_3.jpeg")])
+    tile_dir = tmp_path / "tiles"
+    _write_metadata(tile_dir, "Radiogenomics", "007", [(1, 1)])
+    _write_metadata(tile_dir, "Radiogenomics", "NA", [(2, 2)])
+    _write_metadata(tile_dir, "Radiogenomics", "1001", [(3, 3)])
+
+    plan = rd.build_registration(h5_path, tile_dir, "Radiogenomics",
+                                 str(h5_path), "RADIOGENOMICS")
+
+    assert sorted(plan["coordinates"]["slide_tile"]) == [
+        "007_1_1.JPEG", "1001_3_3.JPEG", "NA_2_2.JPEG"], \
+        plan["coordinates"]["slide_tile"].tolist()
+    assert sorted(plan["coordinates"]["slides"]) == ["007", "1001", "NA"]
+
+
 def test_committing_to_a_database_without_the_base_tables_is_refused(tmp_path):
     """A database built from schema.sql has no wsi_registry at all. Refuse with
     the migration to run, rather than raising an OperationalError naming a
@@ -769,6 +835,211 @@ def test_subset_matching_is_case_insensitive(tmp_path):
                                  "RADIOGENOMICS", scope="subset",
                                  slide_names=["  slide-b  "])
     assert plan["slides"] == ["SLIDE-B"]
+
+
+# --- the tile folder the server registers from ---------------------------
+#
+# register_dataset.py is handed a tile_dataset_name; the server used to take it
+# only from slurm_dataset_runs.dataset_name and refuse when that was NULL
+# ("register it with the CLI instead"). That is a dead end for any run tiled
+# before the column existed, or tiled by hand — and one reached with the KB
+# cohort key already filled in, because dataset_id is a different thing from
+# this folder. The request can now carry it.
+
+
+def _server():
+    import tile_server_v2_ as srv
+    return srv
+
+
+def _run_row(tmp_path: Path, *, dataset_name=None):
+    """A slurm_dataset_runs row shaped the way _registration_plan reads it,
+    with a real packaged .h5 and real Stage 1 metadata under "TCGA"."""
+    h5_path = tmp_path / "packaged.h5"
+    _write_h5(h5_path, [("S1", SLIDE, "1_1.jpeg")])
+    tile_dir = tmp_path / "tiles"
+    _write_metadata(tile_dir, "TCGA", SLIDE, [(1, 1)])
+    raw_dir = _write_raw_slides(tmp_path / "raw", [f"{SLIDE}.svs"])
+    return {
+        "h5_output_path": str(h5_path),
+        "tile_dir": str(tile_dir),
+        "dataset_name": dataset_name,
+        "raw_dir": str(raw_dir),
+        "tiling_params": None,
+    }
+
+
+def test_a_run_with_no_recorded_tile_folder_is_registerable_by_naming_it(tmp_path):
+    srv = _server()
+    row = _run_row(tmp_path, dataset_name=None)
+    req = srv.RegistrationRequest(dataset_id="TCGA", tile_dataset_name="TCGA")
+
+    plan, dataset_id, _raw = srv._registration_plan(row, req)
+
+    assert dataset_id == "TCGA"
+    assert plan["tile_dataset_name"] == "TCGA"
+    # The point of the field: coordinates, which come only from that folder.
+    assert len(plan["coordinates"]) == 1
+
+
+def test_a_dataset_id_alone_does_not_stand_in_for_the_tile_folder(tmp_path):
+    """The reported failure, exactly: a filled-in cohort key and a NULL
+    dataset_name still refuses — and the message has to say which of the two
+    names is missing, or it reads as "I already told you the dataset name"."""
+    from fastapi import HTTPException
+
+    srv = _server()
+    row = _run_row(tmp_path, dataset_name=None)
+    req = srv.RegistrationRequest(dataset_id="TCGA")
+
+    try:
+        srv._registration_plan(row, req)
+    except HTTPException as e:
+        assert e.status_code == 400
+        assert "tile_dataset_name" in str(e.detail)
+        assert "dataset_id" in str(e.detail)
+    else:
+        raise AssertionError("a run with no tile folder anywhere was accepted")
+
+
+def test_both_names_for_the_tile_folder_are_one_field(tmp_path):
+    """dataset_name (main's override) and tile_dataset_name (the older field)
+    name the same folder. Either works; two different values are refused
+    rather than one silently winning — the preview and the commit would
+    otherwise disagree about which folder they read."""
+    from fastapi import HTTPException
+
+    srv = _server()
+    row = _run_row(tmp_path, dataset_name=None)
+    plan, _, _ = srv._registration_plan(row, srv.RegistrationRequest(
+        dataset_id="TCGA", dataset_name="TCGA"))
+    assert plan["tile_dataset_name"] == "TCGA"
+    assert plan["sources"]["dataset_name"] == "supplied"
+
+    try:
+        srv._registration_plan(row, srv.RegistrationRequest(
+            dataset_id="TCGA", dataset_name="TCGA", tile_dataset_name="OTHER"))
+    except HTTPException as e:
+        assert e.status_code == 400 and "different" in str(e.detail)
+    else:
+        raise AssertionError("two different tile folders were accepted")
+
+
+def test_main_s_dataset_name_override_is_charset_checked_too(tmp_path):
+    """The override becomes a path segment under tile_dir, whichever field
+    carries it."""
+    from fastapi import HTTPException
+
+    srv = _server()
+    row = _run_row(tmp_path, dataset_name=None)
+    try:
+        srv._registration_plan(row, srv.RegistrationRequest(
+            dataset_id="TCGA", dataset_name="../TCGA"))
+    except HTTPException as e:
+        assert e.status_code == 400
+    else:
+        raise AssertionError("a tile folder name with '..' reached the filesystem")
+
+
+def test_the_slurm_path_reads_the_same_files_as_the_preview(tmp_path):
+    """/register-submit resolves its paths through _registration_inputs, the
+    function the preview uses, so an h5_path override reaches the job too."""
+    srv = _server()
+    row = _run_row(tmp_path, dataset_name="TCGA")
+    other_h5 = tmp_path / "elsewhere.h5"
+    other_h5.write_bytes(Path(row["h5_output_path"]).read_bytes())
+    inputs = srv._registration_inputs(row, srv.RegistrationRequest(
+        dataset_id="TCGA", h5_path=str(other_h5)))
+    assert inputs["h5_path"] == other_h5
+    assert inputs["sources"]["h5_path"] == "supplied"
+    assert inputs["sources"]["dataset_name"] == "run record"
+
+
+def test_a_supplied_folder_name_cannot_escape_the_tile_directory(tmp_path):
+    """It becomes a literal path segment under tile_dir, so it is charset-checked
+    the same way /submit-dataset-job checks it."""
+    from fastapi import HTTPException
+
+    srv = _server()
+    row = _run_row(tmp_path, dataset_name="TCGA")
+
+    for bad in ("../../etc", "TCGA/../other", "/absolute", ".hidden", ""):
+        req = srv.RegistrationRequest(dataset_id="TCGA", tile_dataset_name=bad)
+        if not bad:
+            # Empty falls through to the recorded name rather than being an
+            # error — the UI's own required field is what stops a blank there.
+            plan, _id, _raw = srv._registration_plan(row, req)
+            assert plan["tile_dataset_name"] == "TCGA"
+            continue
+        try:
+            srv._registration_plan(row, req)
+        except HTTPException as e:
+            assert e.status_code == 400
+        else:
+            raise AssertionError(f"{bad!r} was accepted as a tile folder name")
+
+
+def test_the_supplied_name_wins_over_the_recorded_one_and_is_reported(tmp_path):
+    """Overriding is deliberate — a run may have been re-tiled elsewhere — but a
+    wrong override produces tiles with no coordinates rather than an error, so
+    the folder actually read is carried on the plan for the preview to name."""
+    srv = _server()
+    row = _run_row(tmp_path, dataset_name="TCGA")
+    # A real folder that simply does not hold this run's slides — the existence
+    # guard passes, so what is left is the quiet failure it cannot catch.
+    (Path(row["tile_dir"]) / "Radiogenomics").mkdir(parents=True, exist_ok=True)
+    req = srv.RegistrationRequest(dataset_id="TCGA", tile_dataset_name="Radiogenomics")
+
+    plan, _dataset_id, _raw = srv._registration_plan(row, req)
+
+    assert plan["tile_dataset_name"] == "Radiogenomics"
+    assert len(plan["registry"]) == 1
+    assert len(plan["coordinates"]) == 0
+    assert len(plan["missing_slides"]) == 1
+    assert plan["missing_slides"][0].startswith(SLIDE)
+
+
+def test_a_tile_folder_that_is_not_on_disk_is_refused_not_read_as_empty(tmp_path):
+    """The silent version of this bug: a folder that does not exist yields no
+    metadata, and registration succeeds with every tile carrying no
+    coordinates. Refuse instead."""
+    from fastapi import HTTPException
+
+    srv = _server()
+    row = _run_row(tmp_path, dataset_name="TCGA")
+    req = srv.RegistrationRequest(dataset_id="TCGA", tile_dataset_name="Nonexistent")
+
+    try:
+        srv._registration_plan(row, req)
+    except HTTPException as e:
+        assert e.status_code == 400
+        assert "Nonexistent" in str(e.detail)
+    else:
+        raise AssertionError("a tile folder that is not on disk was accepted")
+
+
+def test_a_case_mismatch_names_the_folder_that_does_exist(tmp_path):
+    """RADIOGENOMICS vs Radiogenomics resolves on macOS and does not on the
+    cluster's Linux filesystem, so the error has to name the real one rather
+    than leaving 'no such folder' to be squared with a folder that is visibly
+    there."""
+    from fastapi import HTTPException
+
+    srv = _server()
+    row = _run_row(tmp_path, dataset_name="TCGA")
+    (Path(row["tile_dir"]) / "Radiogenomics").mkdir(parents=True, exist_ok=True)
+    req = srv.RegistrationRequest(dataset_id="RADIOGENOMICS",
+                                  tile_dataset_name="RADIOGENOMICS")
+
+    try:
+        srv._registration_plan(row, req)
+    except HTTPException as e:
+        assert "Radiogenomics" in str(e.detail)
+        assert "case-sensitive" in str(e.detail)
+    else:
+        # macOS resolves the mismatched case, so the guard cannot fire here —
+        # but then the folder really was found, which is the safe direction.
+        pass
 
 
 # --- standalone runner ---------------------------------------------------

@@ -181,6 +181,39 @@
   z-index: 5;
 }
 
+/* The hover readout. Sits inside the viewer wrap rather than under it so the
+   answer appears where the pointer already is, and never moves the page: a
+   caption below the viewer would reflow the whole column every time the
+   pointer crossed a tile boundary. */
+.viewer-osd-hud {
+  position: absolute;
+  left: 10px;
+  top: 10px;
+  z-index: 6;
+  pointer-events: none;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 6px 10px;
+  border-radius: 8px;
+  background: rgba(17, 24, 39, 0.82);
+  border: 1px solid rgba(255, 255, 255, 0.28);
+  color: #f9fafb;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  line-height: 1.35;
+  max-width: 60%;
+  overflow-wrap: anywhere;
+}
+
+.viewer-osd-hud-tile {
+  font-weight: 700;
+}
+
+.viewer-osd-hud-hpc {
+  opacity: 0.88;
+}
+
 .viewer-osd-failed {
   color: #fecaca;
   padding: 16px;

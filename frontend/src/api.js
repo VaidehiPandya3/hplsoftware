@@ -4,6 +4,23 @@
 
 const BASE_URL = (import.meta.env.VITE_API_BASE_URL || "http://localhost:8000").replace(/\/$/, "");
 
+// A Knowledge Bank write can run for hours on a full cohort, and so can its
+// preview: Stage 6 previews 18.5M keys against tile_registry. The default 30s
+// here meant the browser gave up long before the server did, and the write kept
+// going invisibly — the same failure api_client.py's KB_REQUEST_TIMEOUT exists
+// to prevent. Matches that constant exactly.
+const KB_REQUEST_TIMEOUT = 24 * 60 * 60 * 1000;
+
+// Which Knowledge Bank the server should read and write. Held here rather than
+// passed to each method, for the reason api_client.py gives: roughly a dozen
+// endpoints honour it and the app calls them from far more places than that, so
+// threading an argument through every call site is how one of them ends up
+// reading production while the rest read test — the exact failure this feature
+// exists to avoid.
+export const KB_PRODUCTION = "production";
+export const KB_TEST = "test";
+let kbTarget = KB_PRODUCTION;
+
 class ApiError extends Error {
   constructor(message, status, body) {
     super(message);
@@ -14,8 +31,14 @@ class ApiError extends Error {
 
 async function request(path, { method = "GET", params, json, timeoutMs = 30000, ...rest } = {}) {
   const url = new URL(BASE_URL + path);
-  if (params) {
-    for (const [k, v] of Object.entries(params)) {
+  // Sent on every GET, mirroring api_client.py's _get. Endpoints that do not
+  // declare it ignore it — the pipeline and run-tracking routes are
+  // production-only by design — so this cannot make one of them read the wrong
+  // database, and it removes the need to remember which reads are KB reads.
+  // POSTs carry it in the body instead, again as api_client.py does.
+  const merged = method === "GET" ? { ...(params || {}), kb_target: kbTarget } : params;
+  if (merged) {
+    for (const [k, v] of Object.entries(merged)) {
       if (v !== undefined && v !== null) url.searchParams.set(k, v);
     }
   }
@@ -54,8 +77,15 @@ async function postJson(path, jsonBody, opts) {
 
 function imageUrl(path, params) {
   const url = new URL(BASE_URL + path);
-  if (params) {
-    for (const [k, v] of Object.entries(params)) {
+  // Image endpoints go through _get in api_client.py, so they receive
+  // kb_target there too. Including it here matters for a second reason the
+  // Python client handles differently: set_kb_target() clears its image cache
+  // because a slide_id only means one thing within a single KB. The browser's
+  // cache cannot be cleared from here, so the target is part of the URL and a
+  // switch simply misses the old entries.
+  const merged = { ...(params || {}), kb_target: kbTarget };
+  {
+    for (const [k, v] of Object.entries(merged)) {
       if (v !== undefined && v !== null) url.searchParams.set(k, v);
     }
   }
@@ -65,6 +95,13 @@ function imageUrl(path, params) {
 export const api = {
   baseUrl: BASE_URL,
   ApiError,
+
+  // -- Knowledge Bank target ------------------------------------------
+  getKbTarget: () => kbTarget,
+  setKbTarget(target) {
+    kbTarget = target === KB_TEST ? KB_TEST : KB_PRODUCTION;
+    return kbTarget;
+  },
 
   // -- Health / slide list --------------------------------------------
   health: () => getJson("/health"),
@@ -85,6 +122,37 @@ export const api = {
   getTileDatasetNames: async () => (await getJson("/tile-dataset-names")).dataset_names,
 
   submitDatasetJob: (body) => postJson("/dataset-jobs", cleanBody(body)),
+
+  // One click: Stages 1-4 as a single Nextflow run (POST /pipeline-runs).
+  // Every input a later stage used to ask for at its own button is sent here,
+  // once; the server refuses before queueing anything if one is wrong. Polled
+  // through getDatasetJobStatus like any run — its `pipeline` block says where
+  // each stage is. Registration and the KB load stay manual.
+  // One click: ANORAK on its own over a dataset path. Without slidesCsv every
+  // slide in the directory is graded, recorded as tumour-unverified.
+  startAnorakRun: ({ datasetPath, slidesCsv = null, sampleSize = null, seed = null }) =>
+    postJson(
+      "/anorak-runs",
+      cleanBody({ dataset_path: datasetPath, slides_csv: slidesCsv, sample_size: sampleSize, seed }),
+      { timeoutMs: 300000 },
+    ),
+  // Resubmit a stopped ANORAK run exactly as it was, with -resume.
+  resumeAnorakRun: (submissionId) =>
+    postJson(`/dataset-jobs/${submissionId}/anorak-resume`, {}, { timeoutMs: 300000 }),
+
+  // The settings a one-click run uses — all the server's own.
+  getPipelineDefaults: () => getJson("/pipeline-defaults"),
+  startPipelineRun: (body) => postJson("/pipeline-runs", cleanBody(body), { timeoutMs: 120000 }),
+  // Resubmit a stopped pipeline run with -resume: re-runs only what did not
+  // finish, with the run's own recorded settings.
+  resumePipelineRun: (submissionId, { chain = null, timeLimit = null, allowIncomplete = null } = {}) =>
+    postJson(`/dataset-jobs/${submissionId}/pipeline-resume`, {
+      chain,
+      time_limit: timeLimit,
+      allow_incomplete: allowIncomplete,
+    }),
+  checkPipelineSubmit: (partition = null) =>
+    getJson("/pipeline-submit-check", { params: partition ? { partition } : undefined, timeoutMs: 180000 }),
 
   listDatasetJobs: (withState = false) =>
     withState
@@ -159,48 +227,200 @@ export const api = {
   checkCohortShift: (submissionId, { csvPath = null, topSlides = 10 } = {}) =>
     postJson(`/dataset-jobs/${submissionId}/cohort-shift`, { csv_path: csvPath, top_slides: topSlides }),
 
-  // Registration — the identity rows Stage 6's UPDATE needs to exist. Every
-  // path the endpoint needs is already on the run record, so only the cohort
-  // key and the two opt-ins are sent.
+  // Stage 7: ANORAK growth-pattern grading. Gated on nothing this pipeline
+  // produces — see startAnorak's own note — so it can be submitted whenever a
+  // tumour-slide list exists.
+  //
+  // scope="subset" samples sampleSize slides at random rather than taking the
+  // first N — the first N of a cohort sorted by slide id is usually one or two
+  // patients, sharing a scanner, a batch and a stain run. resume continues the
+  // run's cached Nextflow work directory, which is what makes a resubmission
+  // after a fixed container re-run only what failed. chain is the number of
+  // head jobs — the first plus standbys that resume it if it hits its walltime
+  // or runs out of watchdog restarts; 2 here, 1 on the server for old clients.
+  startAnorak: (
+    submissionId,
+    {
+      slidesCsv,
+      scope = "full",
+      sampleSize = null,
+      seed = null,
+      resume = true,
+      overwrite = false,
+      timeLimit = null,
+      chain = 2,
+    } = {}
+  ) =>
+    postJson(`/dataset-jobs/${submissionId}/anorak`, {
+      slides_csv: slidesCsv,
+      scope,
+      sample_size: sampleSize,
+      seed,
+      resume,
+      overwrite,
+      time_limit: timeLimit,
+      chain,
+    }),
+
+  // Whether a compute node can reach the Slurm controller. Worth once per
+  // cluster before the first ANORAK run: the Nextflow head job submits every
+  // task itself, and on a cluster where compute nodes cannot submit it waits
+  // out its time limit having done nothing.
+  checkAnorakSubmit: (partition = null) =>
+    getJson("/anorak-submit-check", partition ? { params: { partition } } : undefined),
+
+  // Registration — the identity rows Stage 6's UPDATE needs to exist.
+  //
+  // tile_dataset_name is the folder under processed_tiles that Stage 1 wrote
+  // this run's per-slide _tile_metadata.csv files into, and it is NOT
+  // dataset_id: that is the cohort key the KB groups by, this is a directory on
+  // disk. Every tile's x/y is read from there, so a wrong or absent value does
+  // not fail — it registers tiles with no coordinates. It is sent on both
+  // preview and commit because the two have to read the same folder; numbers
+  // previewed against one and committed against another describe a cohort the
+  // write did not touch.
+  //
+  // scope/slide_names were accepted by api_client.py's methods and then left
+  // out of the body once, so a subset previewed as three slides committed as
+  // the whole dataset — silently, because registering more than you meant to
+  // still succeeds.
   previewRegistration: (
     submissionId,
-    { datasetId = null, slideMetadata = false, writeDatasetConfig = true, replace = false } = {}
+    {
+      datasetId = null,
+      tileDatasetName = null,
+      scope = "full",
+      slideNames = null,
+      slideMetadata = false,
+      writeDatasetConfig = true,
+      replace = false,
+    } = {}
   ) =>
-    postJson(`/dataset-jobs/${submissionId}/register-preview`, {
-      dataset_id: datasetId,
-      slide_metadata: slideMetadata,
-      write_dataset_config: writeDatasetConfig,
-      replace,
-    }),
+    postJson(
+      `/dataset-jobs/${submissionId}/register-preview`,
+      {
+        dataset_id: datasetId,
+        tile_dataset_name: tileDatasetName,
+        kb_target: kbTarget,
+        scope,
+        slide_names: slideNames,
+        slide_metadata: slideMetadata,
+        write_dataset_config: writeDatasetConfig,
+        replace,
+      },
+      { timeoutMs: KB_REQUEST_TIMEOUT }
+    ),
 
   commitRegistration: (
     submissionId,
-    { datasetId = null, slideMetadata = false, writeDatasetConfig = true, replace = false } = {}
+    {
+      datasetId = null,
+      tileDatasetName = null,
+      scope = "full",
+      slideNames = null,
+      slideMetadata = false,
+      writeDatasetConfig = true,
+      replace = false,
+    } = {}
   ) =>
-    postJson(`/dataset-jobs/${submissionId}/register`, {
+    postJson(
+      `/dataset-jobs/${submissionId}/register`,
+      {
+        dataset_id: datasetId,
+        tile_dataset_name: tileDatasetName,
+        kb_target: kbTarget,
+        scope,
+        slide_names: slideNames,
+        slide_metadata: slideMetadata,
+        write_dataset_config: writeDatasetConfig,
+        replace,
+      },
+      { timeoutMs: KB_REQUEST_TIMEOUT }
+    ),
+
+  // Queue Stage 5 on Slurm instead of writing inside the request. Returns as
+  // soon as sbatch has taken the job, so the write outlives this tab and the
+  // server both — poll getDatasetJobStatus for registration_slurm_state and
+  // registration_done. The job sets done itself, so it still means committed.
+  // Same arguments and the same guards as commitRegistration; only the where
+  // differs. No long timeout: this call only waits for sbatch.
+  submitRegistration: (
+    submissionId,
+    {
+      datasetId = null,
+      tileDatasetName = null,
+      scope = "full",
+      slideNames = null,
+      slideMetadata = false,
+      writeDatasetConfig = true,
+      replace = false,
+    } = {}
+  ) =>
+    postJson(`/dataset-jobs/${submissionId}/register-submit`, {
       dataset_id: datasetId,
+      tile_dataset_name: tileDatasetName,
+      kb_target: kbTarget,
+      scope,
+      slide_names: slideNames,
       slide_metadata: slideMetadata,
       write_dataset_config: writeDatasetConfig,
       replace,
     }),
 
   previewKbLoad: (submissionId, { minMargin = 0.0, csvPath = null } = {}) =>
-    postJson(`/dataset-jobs/${submissionId}/kb-load-preview`, {
-      min_margin: minMargin,
-      csv_path: csvPath,
-    }),
+    postJson(
+      `/dataset-jobs/${submissionId}/kb-load-preview`,
+      { min_margin: minMargin, csv_path: csvPath, kb_target: kbTarget },
+      { timeoutMs: KB_REQUEST_TIMEOUT }
+    ),
 
   commitKbLoad: (
     submissionId,
-    { cancerType = null, allowUnknownClusters = false, skipProfiles = false, minMargin = 0.0, csvPath = null } = {}
+    {
+      cancerType = null,
+      allowUnknownClusters = false,
+      skipProfiles = false,
+      minMargin = 0.0,
+      csvPath = null,
+    } = {}
   ) =>
-    postJson(`/dataset-jobs/${submissionId}/kb-load`, {
+    postJson(
+      `/dataset-jobs/${submissionId}/kb-load`,
+      {
+        cancer_type: cancerType,
+        allow_unknown_clusters: allowUnknownClusters,
+        skip_profiles: skipProfiles,
+        csv_path: csvPath,
+        min_margin: minMargin,
+        kb_target: kbTarget,
+      },
+      { timeoutMs: KB_REQUEST_TIMEOUT }
+    ),
+
+  // Queue Stage 6 on Slurm. See submitRegistration.
+  submitKbLoad: (
+    submissionId,
+    {
+      cancerType = null,
+      allowUnknownClusters = false,
+      skipProfiles = false,
+      minMargin = 0.0,
+      csvPath = null,
+    } = {}
+  ) =>
+    postJson(`/dataset-jobs/${submissionId}/kb-load-submit`, {
       cancer_type: cancerType,
       allow_unknown_clusters: allowUnknownClusters,
       skip_profiles: skipProfiles,
       csv_path: csvPath,
       min_margin: minMargin,
+      kb_target: kbTarget,
     }),
+
+  // Can a compute node reach Postgres? Queues a one-second srun, so it is slow
+  // — minutes if the queue is busy — and is only worth calling when a
+  // Slurm-backed KB write has been refused or has failed to connect.
+  checkKbJobDb: () => getJson("/kb-job-db-check", { timeoutMs: 300000 }),
 
   startTestPackaging: (
     submissionId,
@@ -254,8 +474,31 @@ export const api = {
   // -- H5 tile image by slide_tile key ---------------------------------------
   tileImageUrl: (slideTile, quality = 85) => imageUrl(`/tile_image/${slideTile}`, { quality }),
 
+  // Full NL query pipeline (Phase 2 — see tile_server_v2_.py's /query
+  // docstring). `history` is the last few {role, content} chat turns (used
+  // for follow-up questions); `sessionContext` mirrors app_v28.py's
+  // active_slide/viewer_open/selected_hpc/highlight_mode dict, so "this
+  // slide"/"that HPC" can resolve against whatever this client currently has
+  // open — the server has no session of its own to read that from.
+  query: (queryText, slideId = null, { history = null, sessionContext = null } = {}) =>
+    postJson("/query", {
+      query: queryText,
+      slide_id: slideId,
+      kb_target: kbTarget,
+      history,
+      session_context: sessionContext,
+    }),
+
   // -- DZI (OpenSeadragon reads this directly, but exposed for convenience) --
-  dziUrl: (slideId) => `${BASE_URL}/dzi/${slideId}.dzi`,
+  // OpenSeadragon fetches this itself, so none of the parameters get() and
+  // post() attach come with it — kb_target has to be on the URL or the viewer
+  // resolves every slide against production. It goes on the ".dzi" URL
+  // specifically: DziTileSource matches /\.(dzi|xml|js)\?/ and copies the query
+  // onto each ..._files/{level}/{col}_{row}.jpeg it builds, so this is also
+  // what carries the target to the tiles. The id is encoded because ours hold
+  // spaces and colons.
+  dziUrl: (slideId) =>
+    `${BASE_URL}/dzi/${encodeURIComponent(slideId)}.dzi?kb_target=${encodeURIComponent(kbTarget)}`,
 };
 
 async function postFormData(path, form, { timeoutMs = 30000 } = {}) {

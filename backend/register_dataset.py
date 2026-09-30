@@ -28,9 +28,18 @@ is the failure this codebase is written against. One command, one transaction,
 all five tables or none.
 
 Before this, the ONLY thing that ever inserted into wsi_registry was
-_register_uploaded_slide() on the interactive single-slide drag-and-drop path,
-which hard-codes dataset_id='UPLOADED'. No bulk Slurm dataset run has ever
-registered a slide.
+_register_uploaded_slide() on the interactive single-slide drag-and-drop path.
+No bulk Slurm dataset run has ever registered a slide.
+
+That upload path now runs through this script too: an uploaded slide gets its
+own run and its own dataset_id ("UPLOADED_<SLIDE_ID>", see
+tile_server_v2_.upload_dataset_name), so it reaches the Knowledge Bank the
+same way a cohort does. One consequence is worth knowing before reading a
+refusal here: the upload already wrote that slide's wsi_registry row at upload
+time, so the viewer could open it immediately, which means registering an
+upload always finds its own cohort occupied and needs --replace. The delete
+that follows is scoped to that one dataset_id, which for an upload is that one
+slide.
 
 image_index (tile_registry) / h5_index (tile_coordinates) is the tile's row
 position in the packaged .h5 — the actual array index, not anything derived
@@ -78,9 +87,11 @@ from load_hpc_assignments import _LOOKUP_CHUNK, make_engine  # noqa: E402
 from slide_naming import (  # noqa: E402
     file_uuid_from_raw_path,
     make_slide_tile_series,
+    normalize_tile_names,
     slide_id_from_raw_path,
-    tiles_missing_suffix,
+    tile_name_verdict,
 )
+from run_record import record_run  # noqa: E402
 from tile_metadata import read_tile_metadata, tile_metadata_path  # noqa: E402
 
 _TILE_COORDINATES_COLUMNS = (
@@ -136,19 +147,35 @@ def read_h5_identity(h5_path: Path) -> pd.DataFrame:
         slides = [v.decode("utf-8", "replace") for v in f["slides"][:]]
         tiles_raw = f["tiles"][:]
 
-    if tiles_missing_suffix(tiles_raw):
+    # A .h5 packaged before make_hpl_hdf5.py started storing "18_15.jpeg" holds
+    # "18_15", which joins nothing in the KB. That used to be refused here and
+    # sent to migrate_tile_names.py; the suffix is appended instead, because the
+    # mapping is total and lossless (auto_tile_from_mask.py:150 writes every
+    # tile as f"{col}_{row}.jpeg") and the count is reported rather than the
+    # correction being made silently.
+    #
+    # Mixed is the exception and is still refused. It is what a resume that
+    # straddled the fix leaves behind, the two sides cannot be told apart by
+    # name, and appending to one of them would attach real cluster IDs to the
+    # wrong tiles — the exact failure this codebase is written against.
+    verdict = tile_name_verdict(tiles_raw)
+    if verdict == "mixed":
         raise SystemExit(
-            f"{h5_path} has tile names without a file extension (e.g. "
-            f"{tiles_raw[0]!r}). This .h5 was packaged before the tile-name fix. "
-            f"Migrate it first: python migrate_tile_names.py --h5 {h5_path} --commit"
+            f"{h5_path} has SOME tile names with a file extension and some "
+            f"without. That is what a packaging resume straddling the tile-name "
+            f"fix leaves behind, and the two cannot be told apart by name, so "
+            f"the suffix cannot be filled in. Repackage this dataset."
         )
-    tiles = [v.decode("utf-8", "replace") for v in tiles_raw]
+    tiles, renamed = normalize_tile_names(tiles_raw)
 
     frame = pd.DataFrame({
         "samples": samples, "slides": slides, "tiles": tiles,
         "image_index": np.arange(n, dtype=np.int64),
     })
     frame["slide_tile"] = make_slide_tile_series(frame["slides"], frame["tiles"])
+    # Carried on the frame rather than returned alongside it: read_h5_identity's
+    # single return value is what every caller and test already expects.
+    frame.attrs["tile_names_normalized"] = renamed
     return frame
 
 
@@ -170,15 +197,54 @@ def read_tile_coordinates(tile_dir: Path, tile_dataset_name: str,
         if not meta.usable:
             missing.append(f"{slide_id} ({meta.status}: {meta.detail})")
             continue
-        frames.append(meta.frame)
+        frames.append(_with_identity_as_text(meta.frame, path))
 
     if not frames:
         return pd.DataFrame(columns=["slides", "tiles", "col", "row", "x_5x",
                                      "y_5x", "x_native", "y_native", "slide_tile"]), missing
 
     coords = pd.concat(frames, ignore_index=True)
+    # Stage 1 metadata written before the same fix carries short names too, and
+    # normalising only the .h5 would leave this side short — which does not
+    # fail, it comes back as tiles_with_coordinates: 0, the silent version of
+    # the bug the .h5 guard used to catch loudly.
+    verdict = tile_name_verdict(coords["tiles"])
+    if verdict == "mixed":
+        raise SystemExit(
+            f"Stage 1 metadata under {tile_dir / tile_dataset_name} has some "
+            f"tile names with a file extension and some without, so the suffix "
+            f"cannot be filled in. Re-tile the slides this covers."
+        )
+    coords["tiles"], renamed = normalize_tile_names(coords["tiles"])
     coords["slide_tile"] = make_slide_tile_series(coords["slides"], coords["tiles"])
+    coords.attrs["tile_names_normalized"] = renamed
     return coords, missing
+
+
+def _with_identity_as_text(frame: pd.DataFrame, path: Path) -> pd.DataFrame:
+    """`slides` and `tiles` exactly as Stage 1's CSV spells them.
+
+    tile_metadata.read_tile_metadata() lets pandas guess column types, which it
+    must for col/row — its null check is what catches a CSV truncated
+    mid-write. For the two identity columns that guess is a rewrite: an
+    all-digit slide id comes back as a number ('007' -> 7) and one called 'NA'
+    as NaN, so the coordinates' key is '7_1_1.JPEG' against the .h5's
+    '007_1_1.JPEG' and the slide registers with tiles_with_coordinates: 0 —
+    well-formed, and silently wrong. Only these two columns are re-read, as
+    text; the file is small, and the length check makes certain the two reads
+    line up row for row rather than assuming it.
+    """
+    identity = pd.read_csv(path, usecols=["slides", "tiles"], dtype=str,
+                           keep_default_na=False)
+    if len(identity) != len(frame) or not frame.index.equals(identity.index):
+        raise SystemExit(
+            f"{path}: re-reading slides/tiles as text gave {len(identity):,} "
+            f"row(s) against {len(frame):,} from the metadata reader, so the "
+            f"two cannot be attached to each other. Re-tile this slide.")
+    frame = frame.copy()
+    frame["slides"] = identity["slides"]
+    frame["tiles"] = identity["tiles"]
+    return frame
 
 
 def find_slide_files(raw_dir: Path, slide_ids) -> tuple[dict, list[str], list[str]]:
@@ -246,10 +312,13 @@ def read_slide_metadata(slide_files: dict, samples_by_slide: dict,
     """What OpenSlide reports about each slide, for wsi_metadata.
 
     Opens every slide, so it is opt-in (--slide-metadata): 14,044 headers is
-    minutes of network I/O, not seconds. Nothing reads wsi_metadata today, but
-    it is where the numbers live that would let the viewer stop assuming every
-    slide in every cohort was scanned at 0.252 mpp — tile_server_v2_.py:216-218
-    computes TILE_SIZE_NATIVE from that constant for all of them.
+    minutes of network I/O, not seconds. mpp_x is the column that stopped the
+    viewer assuming every slide in every cohort was scanned at 0.252 µm/px —
+    tile_server_v2_._tile_size_native() derives each slide's tile size from
+    the tiles' own coordinates, and falls back to the slide's mpp. It reads
+    mpp off the slide rather than out of this table, so wsi_metadata is still
+    on no read path; what this docstring used to describe as hypothetical is
+    the reason the numbers are worth capturing.
 
     A slide that fails to open is reported, not raised: one unreadable file out
     of thousands should not cost the registration of the rest, and the tile
@@ -473,6 +542,14 @@ def build_registration(h5_path: Path, tile_dir: Path, tile_dataset_name: str,
         "ambiguous_slides": ambiguous_slides,
         "unreadable_slides": unreadable_slides,
         "conflicting_samples": conflicting_samples,
+        # How many tile names on each side had ".jpeg" appended to make the join
+        # key. Reported rather than silent: this is a correction to identity,
+        # and the whole argument for making it automatically is that it is
+        # visible when it happens.
+        "tile_names_normalized": {
+            "h5": int(identity.attrs.get("tile_names_normalized", 0)),
+            "coordinates": int(coords.attrs.get("tile_names_normalized", 0)),
+        },
     }
 
 
@@ -588,6 +665,7 @@ def preview(engine, plan: dict, dataset_id: str) -> dict:
         "ambiguous_slides": plan["ambiguous_slides"],
         "unreadable_slides": plan["unreadable_slides"],
         "conflicting_samples": plan["conflicting_samples"],
+        "tile_names_normalized": plan["tile_names_normalized"],
         "existing": existing,
         "foreign_collisions": foreign,
     }
@@ -725,6 +803,15 @@ def report(result: dict, commit_mode: bool) -> None:
     print(f"slides with metadata    {result['slides_with_metadata']:,}")
     print(f"dataset_config rows     {result['dataset_config_rows']:,}")
 
+    renamed = result.get("tile_names_normalized") or {}
+    if any(renamed.values()):
+        print(f"\ntile names            .jpeg appended to "
+              f"{renamed.get('h5', 0):,} name(s) from the .h5 and "
+              f"{renamed.get('coordinates', 0):,} from Stage 1's metadata, so "
+              f"they match the '18_15.jpeg' form the Knowledge Bank joins on. "
+              f"The artifacts on disk still hold the short form — "
+              f"migrate_tile_names.py fixes them there.")
+
     if not result["slides_registered"]:
         print("\nNo wsi_registry rows: --raw-dir was not given. The tiles will "
               "be registered, Stage 5 will load, and the viewer will still 404 "
@@ -846,6 +933,19 @@ def main() -> None:
         help="Slide ID to register when --scope subset is used. "
              "Repeat for multiple slides.",
     )
+    # Used when this runs as the Slurm job the server submits: the job is the
+    # process that knows whether the write committed, so it is the one that
+    # records it. Harmless and inert on a hand-run CLI invocation.
+    parser.add_argument("--record-run", default=None, metavar="SUBMISSION_ID",
+                        help="Record the outcome against this run in "
+                             "slurm_dataset_runs.")
+    parser.add_argument("--record-run-db", default=None, metavar="DBNAME",
+                        help="Database holding slurm_dataset_runs. Run tracking "
+                             "stays in production whichever Knowledge Bank the "
+                             "rows go to, so this is separate from DB_NAME.")
+    parser.add_argument("--record-kb-target", default=None,
+                        help="Recorded as registration_kb_target, so the run "
+                             "says which Knowledge Bank it filled.")
     args = parser.parse_args()
 
     if not args.h5.is_file():
@@ -886,8 +986,29 @@ def main() -> None:
         return
 
     result = preview(engine, plan, args.dataset_id)  # for the report's numbers
-    written = commit(engine, plan, args.dataset_id, args.replace)
+    try:
+        written = commit(engine, plan, args.dataset_id, args.replace)
+    except BaseException as e:
+        # Recorded before re-raising so a refusal or a crash leaves a reason on
+        # the run rather than a stage that simply stopped saying anything. The
+        # job's log has the traceback; this is what the UI can show.
+        if args.record_run and args.record_run_db:
+            record_run(args.record_run_db, args.record_run,
+                       registration_error=f"{type(e).__name__}: {e}"[:2000])
+        raise
     report(result, commit_mode=True)
+    if args.record_run and args.record_run_db:
+        record_run(
+            args.record_run_db, args.record_run,
+            registration_done=True,
+            registration_at=datetime.now(timezone.utc),
+            registration_dataset_id=args.dataset_id,
+            registration_raw_dir=str(args.raw_dir) if args.raw_dir else None,
+            registration_rows=json.dumps(written),
+            registration_error=None,
+            **({"registration_kb_target": args.record_kb_target}
+               if args.record_kb_target else {}),
+        )
     print("\nwritten        " + ", ".join(f"{t} +{n:,}" for t, n in written.items()))
     print("\nNext: run load_hpc_assignments.py to fill in hpc_id and the "
           "per-slide aggregates.")

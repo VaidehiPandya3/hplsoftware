@@ -321,14 +321,12 @@ def package_slides_to_h5(
     and can differ (e.g. a subset run's "TCGA_subset_1").
 
     slide_ids, if given, must be the same length and order as raw_paths and
-    overrides slide_id_from_raw_path() per slide — needed by a caller whose
-    raw file's storage path isn't name-derivable (e.g. the tile server's
-    ad-hoc uploads, stored under a server-generated UUID directory with no
-    parseable slide_id embedded in the filename). Without this, such a
-    caller's tiles (written under the slide_id it explicitly chose — see
-    tile_slide_from_mask's own slide_id override) simply wouldn't be found
-    here, since this would derive a different, wrong slide_id from the raw
-    path alone.
+    overrides slide_id_from_raw_path() per slide — needed by a caller that
+    already knows which slide this is (e.g. the tile server's ad-hoc uploads,
+    where the id is the one the user chose). Without it, such a caller's tiles
+    (written under that chosen id — see tile_slide_from_mask's own slide_id
+    override) would be looked for under whatever the stored filename derives
+    to, which is not the same thing.
 
     Reading and decoding tiles (not writing — that stays single-threaded
     and sequential, h5py isn't safe for concurrent writes) is parallelized

@@ -1,0 +1,149 @@
+.chat-panel {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--panel-bg);
+  padding: 12px;
+  margin-bottom: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.chat-history {
+  max-height: 360px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding-right: 4px;
+}
+
+.chat-empty {
+  color: #9ca3af;
+  font-size: 13px;
+  padding: 8px 2px;
+}
+
+.chat-message {
+  display: flex;
+}
+
+.chat-message-user {
+  justify-content: flex-end;
+}
+
+.chat-message-assistant {
+  justify-content: flex-start;
+}
+
+.chat-message-bubble {
+  max-width: 80%;
+  border-radius: 10px;
+  padding: 8px 12px;
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.chat-message-user .chat-message-bubble {
+  background: #3730a3;
+  color: #f3f4f6;
+}
+
+.chat-message-assistant .chat-message-bubble {
+  background: #1f2937;
+  color: #e5e7eb;
+  border: 1px solid var(--border);
+}
+
+.chat-message-text {
+  white-space: pre-wrap;
+}
+
+.chat-typing {
+  color: #9ca3af;
+  font-size: 12px;
+  font-style: italic;
+}
+
+.chat-tile-images {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.chat-tile-image {
+  margin: 0;
+  width: 90px;
+}
+
+.chat-tile-image img {
+  width: 90px;
+  height: 90px;
+  object-fit: cover;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  display: block;
+}
+
+.chat-tile-image figcaption {
+  font-size: 10px;
+  color: #9ca3af;
+  text-align: center;
+  margin-top: 2px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat-input-row {
+  display: flex;
+  gap: 8px;
+}
+
+.chat-input-row input {
+  flex: 1;
+  background: var(--bg);
+  color: var(--text-h);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px;
+  font-size: 13px;
+}
+
+.chat-input-row button {
+  background: #3730a3;
+  color: #f3f4f6;
+  border: none;
+  border-radius: 6px;
+  padding: 8px 16px;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.chat-input-row button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.chat-debug {
+  font-size: 12px;
+  color: #9ca3af;
+}
+
+.chat-debug summary {
+  cursor: pointer;
+}
+
+.chat-debug pre {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px;
+  overflow-x: auto;
+  max-height: 240px;
+}
+
+.chat-debug-caption {
+  margin-top: 4px;
+}

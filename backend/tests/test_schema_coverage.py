@@ -266,6 +266,95 @@ def test_schema_sql_says_it_is_stale(_tmp=None):
     )
 
 
+# --- the indexes the previews depend on ----------------------------------
+#
+# Every lookup in the two Knowledge Bank stages filters on a *function* of the
+# key — WHERE UPPER(slide_tile) IN :tiles — and Postgres matches an expression
+# index by expression, not by value. So a plain index on slide_tile does not
+# apply, however normalised the stored values are, and those queries were
+# sequential scans: Stage 6's preview chunks 18.5M keys 10,000 at a time, which
+# is ~1,850 full scans of an 18.5M-row table to dry-run a load that writes
+# nothing.
+#
+# Nothing about that fails, which is why it needs a test: the only symptom is
+# that a preview takes longer than the write it is previewing. If someone edits
+# the query to UPPER(TRIM(slide_tile)) — the form used elsewhere in the same
+# file — the index silently stops applying and the slowness comes back.
+
+INDEXES_SQL = BACKEND / "migrate_indexes.sql"
+
+_EXPRESSION_LOOKUPS = (
+    # (file, expression as the query writes it, table it filters)
+    ("load_hpc_assignments.py", "UPPER(slide_tile)", "tile_registry"),
+    ("load_hpc_assignments.py", "UPPER(TRIM(slides))", "tile_registry"),
+    # register_dataset.py's collision check builds the column name into the
+    # expression (f"UPPER({key})"), one query over four tables, so the literal
+    # to look for is the template rather than any one column.
+    ("register_dataset.py", "UPPER({key})", None),
+)
+
+#: The tables register_dataset._foreign_scope reaches through that template, and
+#: the column each is keyed by (_KEY_COLUMN). Both slide_tile tables and both
+#: slide_id tables therefore need the expression indexed.
+_TEMPLATED_TABLES = (
+    ("tile_registry", "UPPER(slide_tile)"),
+    ("tile_coordinates", "UPPER(slide_tile)"),
+    ("wsi_registry", "UPPER(slide_id)"),
+    ("wsi_metadata", "UPPER(slide_id)"),
+)
+
+
+def _normalise(sql: str) -> str:
+    """Whitespace- and case-insensitive, with SQL comments removed — a comment
+    mentioning CREATE INDEX is not a CREATE INDEX, which is exactly what the
+    first version of this test tripped over."""
+    without_comments = re.sub(r"--[^\n]*", "", sql)
+    return re.sub(r"\s+", "", without_comments).upper()
+
+
+def test_every_expression_filtered_on_is_indexed_as_that_expression(_tmp=None):
+    indexes = _normalise(INDEXES_SQL.read_text())
+
+    missing = []
+    for filename, expression, table in _EXPRESSION_LOOKUPS:
+        source = (BACKEND / filename).read_text()
+        # The source is Python, so no SQL comment stripping — just whitespace.
+        if re.sub(r"\s+", "", expression).upper() not in \
+                re.sub(r"\s+", "", source).upper():
+            missing.append(f"{filename} no longer filters on {expression}")
+            continue
+        targets = ([(table, expression)] if table
+                   else list(_TEMPLATED_TABLES))
+        for target_table, target_expression in targets:
+            wanted = _normalise(f"ON {target_table} ({target_expression})")
+            if wanted not in indexes:
+                missing.append(
+                    f"{target_table} is filtered by {target_expression} in "
+                    f"{filename}, and migrate_indexes.sql has no index on that "
+                    f"expression")
+    assert not missing, "; ".join(missing)
+
+
+def test_the_index_check_can_fail(_tmp=None):
+    """An expression nothing indexes must be reported, or the test above is
+    just reading a file."""
+    indexes = _normalise(INDEXES_SQL.read_text())
+
+    assert _normalise("ON tile_registry (LOWER(slide_tile))") not in indexes
+
+
+def test_the_new_indexes_are_idempotent_like_the_rest(_tmp=None):
+    """This file is run repeatedly against a live database."""
+    # Comments stripped first: this file explains itself at length, and a
+    # sentence about CREATE INDEX is not one.
+    text = re.sub(r"--[^\n]*", "", INDEXES_SQL.read_text())
+    creates = re.findall(r"CREATE (?:UNIQUE )?INDEX(?: IF NOT EXISTS)?", text)
+
+    assert creates, "no CREATE INDEX found at all"
+    assert all("IF NOT EXISTS" in c for c in creates), \
+        "an index is created unguarded; re-running the migration would fail"
+
+
 # --- standalone runner ---------------------------------------------------
 
 def main():

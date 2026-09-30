@@ -14,6 +14,51 @@ import { useState } from "react";
 import { api } from "../../api";
 import { errorDetail } from "./utils";
 import { Alert, Button, Expander, Field } from "./widgets";
+import RunProgress from "./RunProgress";
+
+// Port of _render_upload_pipeline(): Stages 3-7 for an uploaded slide,
+// rendered by the same stepper a dataset run uses.
+//
+// An upload used to stop at its .h5 — feature extraction, cluster
+// classification, registration and the Knowledge Bank load are all keyed on a
+// run, and an upload had none, so an uploaded slide could be looked at and
+// never carried a single HPC label. The backend now creates a one-slide run
+// for every upload, and this is where it is driven.
+function UploadPipeline({ slideId, statusPayload }) {
+  const submissionId = statusPayload && statusPayload.submission_id;
+  if (!submissionId) {
+    return (
+      <Alert type="warning">
+        This upload has no pipeline run on record, so it stops at the tiles. Re-upload the slide
+        to create one; without it the slide can be viewed but cannot reach the Knowledge Bank.
+      </Alert>
+    );
+  }
+  return (
+    <div>
+      <hr className="pipeline-divider" />
+      <div className="pipeline-caption pipeline-caption-strong">
+        <strong>Rest of the pipeline for {slideId}</strong> — cohort{" "}
+        <code>{statusPayload.dataset_name || ""}</code>
+      </div>
+      <div className="pipeline-caption">
+        Steps 1 and 2 were done by the upload itself; run 3 onwards here to get this slide&apos;s
+        tiles into the Knowledge Bank and its HPC overlay into the viewer.
+      </div>
+      {/* Registration always asks for Replace on an uploaded slide, and the
+          refusal it comes from names a row count rather than a reason. Said
+          here because the step itself is shared with cohorts, where the same
+          message means something else entirely. */}
+      <div className="pipeline-caption">
+        Step 5 will report this cohort as already occupied and ask for <strong>Replace</strong> —
+        that is the slide&apos;s own registry row, written at upload time so the viewer could open
+        it straight away. Replace rewrites exactly this slide&apos;s rows and touches no other
+        cohort.
+      </div>
+      <RunProgress submissionId={submissionId} job={{ submission_id: submissionId, total_slides: 1 }} />
+    </div>
+  );
+}
 
 export default function UploadPanel() {
   const [file, setFile] = useState(null);
@@ -210,6 +255,10 @@ export default function UploadPanel() {
                 {statusLoading ? "Refreshing…" : "Refresh status"}
               </Button>
             </>
+          )}
+
+          {statusPayload && (
+            <UploadPipeline slideId={processingSlideId} statusPayload={statusPayload} />
           )}
         </>
       )}

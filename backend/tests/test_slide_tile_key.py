@@ -8,8 +8,11 @@ two against the first two — the Radiogenomics KB load matched 0.0% of 38,892
 tiles, and assign_hpc_clusters.py --validate-against would have merged zero rows
 against Kai's labels.
 
-These tests pin the convention to Kai's CSV, which is the authority, and prove
-the guard against the old form can actually fire.
+These tests pin the convention to Kai's CSV, which is the authority. The short
+form is no longer refused — the loaders append the suffix, because the mapping
+is a bijection — so what has to be proved here is that the repair reaches the
+same key the migrated file would, and that the one unrepairable case (mixed)
+still refuses.
 """
 
 import sys
@@ -25,6 +28,8 @@ sys.path.insert(0, str(BACKEND))
 from slide_naming import (  # noqa: E402
     make_slide_tile,
     make_slide_tile_series,
+    normalize_tile_names,
+    tile_name_verdict,
     tiles_missing_suffix,
 )
 
@@ -111,9 +116,10 @@ def test_packaged_tile_names_match_kais_reference_csv(tmp_path):
     assert not tiles_missing_suffix([_tile_name(_Row())])
 
 
-def test_loader_refuses_a_csv_from_a_stale_h5(tmp_path):
-    """End to end through read_assignments: the suffix-less form must be
-    refused by name, not left to surface as an unexplained 0% match rate."""
+def test_loader_repairs_a_csv_from_a_stale_h5(tmp_path):
+    """End to end through read_assignments: the suffix-less form must come out
+    matching the Knowledge Bank's key, not surface as an unexplained 0% match
+    rate and not be turned away at the door."""
     from load_hpc_assignments import read_assignments
 
     csv_path = tmp_path / "assignments.csv"
@@ -127,16 +133,17 @@ def test_loader_refuses_a_csv_from_a_stale_h5(tmp_path):
         "hpc_reference": ["hpc_reference_leiden_2p5_fold2"] * 3,
     }).to_csv(csv_path, index=False)
 
-    try:
-        read_assignments(csv_path)
-    except SystemExit as e:
-        # Refused, and the message must name the one-command fix rather than
-        # sending anyone off to repackage and re-extract: nothing in this CSV
-        # needs recomputing.
-        assert "extension" in str(e), str(e)
-        assert "migrate_tile_names.py" in str(e), str(e)
-    else:
-        raise AssertionError("a CSV from a stale .h5 must be refused")
+    frame, _cluster_column = read_assignments(csv_path)
+
+    # Loaded rather than refused: nothing in this CSV needs recomputing — the
+    # cluster IDs and margins are correct and only the label was short — so the
+    # suffix is appended and counted on the way in.
+    assert frame["slide_tile"].tolist() == [
+        f"{RADIO_SLIDE.upper()}_24_10.JPEG",
+        f"{RADIO_SLIDE.upper()}_25_10.JPEG",
+        f"{RADIO_SLIDE.upper()}_26_10.JPEG",
+    ]
+    assert frame.attrs["tile_names_normalized"] == 3
 
     # The same CSV with the convention applied loads, and builds the KB's key.
     good = pd.read_csv(csv_path)
@@ -145,6 +152,93 @@ def test_loader_refuses_a_csv_from_a_stale_h5(tmp_path):
     frame, cluster_column = read_assignments(csv_path)
     assert cluster_column == "leiden_2.5"
     assert frame["slide_tile"].iloc[0] == f"{RADIO_SLIDE.upper()}_24_10.JPEG"
+
+
+# --- the repair, and the case it must refuse ------------------------------
+
+
+def test_the_verdict_separates_the_three_states(tmp_path):
+    assert tile_name_verdict(["24_10", "25_10"]) == "short"
+    assert tile_name_verdict([b"24_10.jpeg", "25_10.jpeg"]) == "done"
+    assert tile_name_verdict(["24_10", "25_10.jpeg"]) == "mixed"
+    # Nothing to append to is not the same as "needs migrating".
+    assert tile_name_verdict([]) == "done"
+    assert tile_name_verdict(["", "  "]) == "done"
+
+
+def test_the_verdict_sees_a_mixed_file_the_old_guard_missed(tmp_path):
+    """tiles_missing_suffix() reads the first 100 names and answers True only
+    if none carry an extension, so one suffixed name anywhere in that window
+    makes a half-migrated file look fine. That blind spot is why the verdict
+    reads every name."""
+    tiles = ["24_10"] * 500 + ["25_10.jpeg"]
+
+    assert tiles_missing_suffix(tiles) is True   # says "just short", wrongly
+    assert tile_name_verdict(tiles) == "mixed"   # sees the straddle
+
+
+def test_the_repair_only_ever_appends(tmp_path):
+    names, changed = normalize_tile_names([b"24_10", "25_10.jpeg", "26_10.png"])
+
+    assert names == ["24_10.jpeg", "25_10.jpeg", "26_10.png"]
+    assert changed == 1, "a name that already has an extension is not touched"
+
+
+def test_the_repaired_key_is_the_key_the_kb_stores(tmp_path):
+    """The whole justification: repairing on read must land on exactly the key
+    a correctly-packaged .h5 would have produced."""
+    repaired, _ = normalize_tile_names(["24_10"])
+
+    assert make_slide_tile(RADIO_SLIDE, repaired[0]) == \
+        make_slide_tile(RADIO_SLIDE, "24_10.jpeg")
+
+
+def test_the_loader_refuses_a_half_migrated_csv(tmp_path):
+    """The counterpart to test_loader_repairs_a_csv_from_a_stale_h5: repairing
+    one side of a straddled resume would attach correct cluster IDs to the
+    wrong tiles."""
+    from load_hpc_assignments import read_assignments
+
+    csv_path = tmp_path / "half.csv"
+    pd.DataFrame({
+        "samples": ["BB232560"] * 3,
+        "slides": [RADIO_SLIDE] * 3,
+        "tiles": ["24_10", "25_10.jpeg", "26_10"],
+        "leiden_2.5": [25, 50, 28],
+        "vote_margin": [0.9, 0.4, 0.2],
+        "neighbor_distance": [1.0, 2.0, 3.0],
+        "hpc_reference": ["hpc_reference_leiden_2p5_fold2"] * 3,
+    }).to_csv(csv_path, index=False)
+
+    try:
+        read_assignments(csv_path)
+    except SystemExit as e:
+        assert "Repackage" in str(e), str(e)
+    else:
+        raise AssertionError("a half-migrated CSV must be refused")
+
+
+def test_the_loader_and_the_migrator_agree_on_every_verdict(tmp_path):
+    """Two implementations of one rule, so they are pinned to each other. If
+    they drift, a file the loader repairs is one the migrator calls mixed, or
+    the other way round."""
+    from migrate_tile_names import classify
+
+    for tiles in (["24_10", "25_10"],
+                  ["24_10.jpeg", "25_10.jpeg"],
+                  ["24_10", "25_10.jpeg"],
+                  [b"24_10", b"25_10.jpeg"]):
+        assert tile_name_verdict(tiles) == classify(tiles)[0], tiles
+
+    # One deliberate difference, pinned so it stays deliberate: classify() asks
+    # whether the name ends in ".jpeg" (it is deciding what to write), while the
+    # verdict asks whether it has any extension at all (it is deciding whether
+    # to append). A .png is "already suffixed, leave it" to the loader and
+    # "not a .jpeg" to the migrator. Nothing in this pipeline writes one —
+    # auto_tile_from_mask.py saves JPEG — so the case is theoretical, but the
+    # safe direction is the loader's: never append to a name that has one.
+    assert tile_name_verdict(["24_10.png"]) == "done"
+    assert classify(["24_10.png"])[0] == "short"
 
 
 # --- standalone runner ---------------------------------------------------

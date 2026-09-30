@@ -28,7 +28,12 @@ def build_query_plan_regex(query: str) -> dict[str, Any]:
         k in q for k in ["how many", "count", "total hpcs", "number of hpcs", "portion", "coverage", "percent"]
     )
 
-    greeting = any(w in q for w in ("hello", "hi", "hey", "good morning", "good afternoon"))
+    # Word-boundary match, not substring: plain `"hi" in q`/`"hey" in q` also
+    # matched "which" (w-HI-ch) and "they" (t-HEY) — so "Which slides have
+    # HPC 40?" was classified as a greeting and never reached the database at
+    # all. Any short greeting word is at risk of this; \b keeps it to real
+    # standalone occurrences.
+    greeting = bool(re.search(r"\b(hello|hi|hey|good morning|good afternoon)\b", q))
     help_intent = any(w in q for w in ("what can you do", "help me", "how do i", "capabilities"))
 
     if greeting:

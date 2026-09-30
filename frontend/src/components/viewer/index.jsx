@@ -11,6 +11,7 @@ import {
 import { getHpcSurvivalMapFor, getHpcTitleMapFor } from "./hpcReferenceCache.js";
 import PyramidViewer from "./PyramidViewer.jsx";
 import ClickInspectorViewer from "./ClickInspectorViewer.jsx";
+import TileInfo from "./TileInfo.jsx";
 import Legend from "./Legend.jsx";
 import HpcAnnotation from "./HpcAnnotation.jsx";
 import AdjacencyControls from "./AdjacencyControls.jsx";
@@ -383,8 +384,29 @@ export default function SlideViewer({ slideId }) {
                 dziUrl={api.dziUrl(slideId)}
                 overlayTiles={osdOverlay.records}
                 selectedTileRect={selectedTileRectForPyramid}
+                // The slide's whole tile list, not the filtered overlay set,
+                // and not the 6,000-record cap the overlay draws under: what
+                // a tile *is* does not depend on the legend filter, and a
+                // pointer over tile 8,000 should still be answered.
+                tileIndex={riskTiles}
+                tileSizeNative={slideInfo.tileSizeNative}
+                onSelectTile={setSelectedTile}
                 height={780}
               />
+              {selectedTile && selectedTile.tile && (
+                <div className="viewer-tile-result">
+                  <div className="viewer-info">
+                    Tile selected: {String(selectedTile.tile.tiles || selectedTile.slide_tile)}
+                  </div>
+                  {/* Same panel the click inspector shows, so a tile picked in
+                      either mode reads the same — and the selection itself is
+                      shared state, so switching modes keeps it. */}
+                  <TileInfo tile={selectedTile.tile} heatHpc={highlightMode === "Heatmap" ? heatHpc : null} />
+                  <button type="button" className="viewer-btn" onClick={() => setSelectedTile(null)}>
+                    Clear selection
+                  </button>
+                </div>
+              )}
             </>
           ) : (
             <ClickInspectorViewer

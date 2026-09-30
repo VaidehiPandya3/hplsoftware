@@ -178,6 +178,33 @@ _CONTAINER_EXTRA_PACKAGES = (
     "faiss-cpu",
 )
 
+# Stage 4 can run its exact flat search on a GPU instead, which is the same
+# exhaustive scan on faster hardware (see Searcher._verify_matches_cpu, which
+# refuses a build that disagrees with the CPU index). It lives in a SEPARATE
+# extras directory on purpose: faiss-cpu and a GPU faiss both install as the
+# module `faiss`, and with PYTHONPATH taking precedence over the image's
+# site-packages, having both on one path means whichever sorts first wins —
+# silently, and differently depending on the directory listing.
+CONTAINER_EXTRAS_GPU = Path(
+    os.getenv("HPL_CONTAINER_EXTRAS_GPU",
+              str(SINGULARITY_IMAGE.parent / "extras-py38-gpu"))
+)
+# Tried in order, first one that installs wins. The image is CUDA 12, so
+# faiss-gpu-cu12 is the match — but it is a young package and the container's
+# Python is 3.8, so a cp38 wheel may not exist for it. faiss-gpu-cu11 works
+# against a CUDA 12 driver (minor-version compatibility), and the legacy
+# faiss-gpu is the last resort with the widest cp38 coverage.
+#
+# Whichever lands, Searcher._verify_matches_cpu decides whether it can be
+# trusted: it searches a sample of the reference against both the GPU and CPU
+# indexes and refuses on disagreement. So a wheel that installs but does not
+# work costs a startup refusal, not a cohort of wrong cluster IDs.
+_CONTAINER_EXTRA_PACKAGES_GPU = (
+    "faiss-gpu-cu12",
+    "faiss-gpu-cu11",
+    "faiss-gpu",
+)
+
 # Import-checked in the job before encoding. Module name, not package name:
 # scikit-image installs as `skimage`, and the point is to check the thing the
 # repo actually imports.
@@ -586,6 +613,8 @@ def bootstrap_container_extras(
     *,
     singularity_image: Path = SINGULARITY_IMAGE,
     singularity_bin: str = SINGULARITY_BIN,
+    packages: tuple[str, ...] | None = None,
+    verify: str | None = None,
 ) -> None:
     """One-time install of the packages the NGC image lacks into extras_dir.
 
@@ -609,7 +638,7 @@ def bootstrap_container_extras(
         "--no-deps",
         "--target",
         target,
-        *_CONTAINER_EXTRA_PACKAGES,
+        *(packages if packages is not None else _CONTAINER_EXTRA_PACKAGES),
     ]
     print(f"Installing into {extras_dir}:\n  {shlex.join(command)}", flush=True)
     result = subprocess.run(command, text=True)
@@ -619,9 +648,10 @@ def bootstrap_container_extras(
             f"PyPI, run this on a login node rather than a compute node, or "
             f"download the wheels and pip install them from a local directory."
         )
-    if not (extras_dir / "skimage").is_dir():
+    expected = verify if verify is not None else "skimage"
+    if not (extras_dir / expected).is_dir():
         raise RuntimeError(
-            f"pip reported success but {extras_dir / 'skimage'} is not there. "
+            f"pip reported success but {extras_dir / expected} is not there. "
             f"Check whether --target landed somewhere else."
         )
     print(f"Container extras ready: {extras_dir}")
@@ -807,12 +837,21 @@ def _build_extraction_command(
     batch_size: int,
     extras_dir: Path,
     shard_bounds: list[tuple[int, int]] | None = None,
+    row_range: tuple[int, int] | None = None,
 ) -> str:
     """Shell command the Slurm --wrap runs: probe GPU, check imports, encode.
 
     --cleanenv keeps the host's broken CUDA stubs out of LD_LIBRARY_PATH;
     --nv is what actually injects the driver's libcuda into the container.
+
+    shard_bounds is for a Slurm array: each task picks its range by
+    SLURM_ARRAY_TASK_ID. row_range is one fixed range, for a caller that runs
+    each shard as its own job with no array index — the Nextflow pipeline,
+    where every shard is a separate task. Exactly one or neither.
     """
+    if shard_bounds is not None and row_range is not None:
+        raise ValueError("Pass shard_bounds (a Slurm array) or row_range (one "
+                         "fixed range), not both.")
     binds = _bind_args(
         hpl_repo_dir, real_hdf5_path, checkpoint, singularity_image, extras_dir
     )
@@ -870,27 +909,51 @@ def _build_extraction_command(
         )
     )
 
-    # For an array job the row range comes from the task index. The bounds are
-    # baked in as shell arrays rather than recomputed in the job: the split has
-    # to be identical to the one the merge step will check against, and
-    # recomputing it in two places is how those drift apart.
+    # The row range, resolved OUTSIDE the container and handed in through the
+    # environment. It used to be resolved in here, from SLURM_ARRAY_TASK_ID —
+    # which `singularity exec --cleanenv` has already wiped by then, so under
+    # `set -u` every array task aborted the moment the import check finished.
+    # That is the bug CLAUDE.md records for Stage 4, found there first; this is
+    # the same fix. SINGULARITYENV_/APPTAINERENV_ are the documented route
+    # through --cleanenv, and both prefixes are set because the binary may be
+    # either.
     #
-    # Under `set -u` an unset SLURM_ARRAY_TASK_ID aborts here, which is what we
-    # want — it means a sharded command was submitted as a plain job, and the
-    # alternative is one task silently encoding the wrong range.
-    shard_preamble = ""
+    # For an array the bounds are baked in as shell arrays rather than
+    # recomputed in the job: the split has to be identical to the one the
+    # merge step will check against, and recomputing it in two places is how
+    # those drift apart. The index is still read under `set -u`, out here,
+    # where an unset one really does mean a sharded command was submitted as
+    # a plain job — and one task silently encoding the wrong range is worse
+    # than a refusal.
+    outer_preamble = ""
+    env_prefix = ""
     row_args = ""
-    if shard_bounds is not None:
-        starts = " ".join(str(lo) for lo, _ in shard_bounds)
-        stops = " ".join(str(hi) for _, hi in shard_bounds)
-        shard_preamble = (
-            f"SHARD_STARTS=({starts}); "
-            f"SHARD_STOPS=({stops}); "
-            'ROW_START="${SHARD_STARTS[$SLURM_ARRAY_TASK_ID]}"; '
-            'ROW_STOP="${SHARD_STOPS[$SLURM_ARRAY_TASK_ID]}"; '
-            'echo "=== Shard $SLURM_ARRAY_TASK_ID: rows $ROW_START-$ROW_STOP ==="; '
+    if shard_bounds is not None or row_range is not None:
+        if shard_bounds is not None:
+            starts = " ".join(str(lo) for lo, _ in shard_bounds)
+            stops = " ".join(str(hi) for _, hi in shard_bounds)
+            outer_preamble = (
+                "set -euo pipefail; "
+                f"SHARD_STARTS=({starts}); "
+                f"SHARD_STOPS=({stops}); "
+                'ROW_START="${SHARD_STARTS[$SLURM_ARRAY_TASK_ID]}"; '
+                'ROW_STOP="${SHARD_STOPS[$SLURM_ARRAY_TASK_ID]}"; '
+                'echo "=== Shard $SLURM_ARRAY_TASK_ID: rows $ROW_START-$ROW_STOP ==="; '
+            )
+        else:
+            lo, hi = (int(v) for v in row_range)
+            outer_preamble = (
+                "set -euo pipefail; "
+                f"ROW_START={lo}; ROW_STOP={hi}; "
+                'echo "=== Rows $ROW_START-$ROW_STOP ==="; '
+            )
+        env_prefix = (
+            'SINGULARITYENV_ROW_START="$ROW_START" '
+            'SINGULARITYENV_ROW_STOP="$ROW_STOP" '
+            'APPTAINERENV_ROW_START="$ROW_START" '
+            'APPTAINERENV_ROW_STOP="$ROW_STOP" '
         )
-        row_args = " --row_start $ROW_START --row_stop $ROW_STOP"
+        row_args = ' --row_start "$ROW_START" --row_stop "$ROW_STOP"'
 
     encode = (
         f"cd {shlex.quote(repo_in_job)} && "
@@ -941,11 +1004,10 @@ def _build_extraction_command(
         "echo 'all inputs visible'; "
         "echo '=== Container packages ==='; "
         f"{import_check}; "
-        f"{shard_preamble}"
         "echo '=== Feature extraction ==='; "
         f"{encode}"
     )
-    return " ".join([
+    return outer_preamble + env_prefix + " ".join([
         shlex.quote(singularity_bin),
         "exec",
         "--nv",
@@ -1285,6 +1347,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Install the missing packages into --extras-dir and exit without "
              "submitting. Run once, on a login node (needs PyPI access).",
     )
+    parser.add_argument(
+        "--bootstrap-extras-gpu",
+        action="store_true",
+        help="Install a GPU faiss into a SEPARATE extras directory "
+             "(HPL_CONTAINER_EXTRAS_GPU) for Stage 4's --device gpu, and exit. "
+             "Separate because faiss-cpu and GPU faiss are both imported as "
+             "`faiss`, so one path cannot hold both. Login node, needs PyPI.",
+    )
     parser.add_argument("--model", type=str, default="BarlowTwins_3")
     parser.add_argument("--marker", type=str, default="he")
     parser.add_argument("--z-dim", type=int, default=128)
@@ -1332,6 +1402,42 @@ def main() -> None:
             print(f"Bootstrap failed: {e}", file=sys.stderr)
             raise SystemExit(1)
         return
+
+    if args.bootstrap_extras_gpu:
+        # One candidate at a time, because pip given three names installs the
+        # first it resolves and reports success — and which of the three landed
+        # decides whether the job has a GPU faiss at all. Trying them
+        # individually means the failure of the preferred wheel is visible
+        # rather than hidden behind a fallback.
+        errors = []
+        for package in _CONTAINER_EXTRA_PACKAGES_GPU:
+            print(f"\nTrying {package} ...", flush=True)
+            try:
+                bootstrap_container_extras(
+                    CONTAINER_EXTRAS_GPU,
+                    singularity_image=args.singularity_image,
+                    singularity_bin=args.singularity_bin,
+                    packages=(package,),
+                    verify="faiss",
+                )
+            except (FileNotFoundError, RuntimeError) as e:
+                errors.append(f"{package}: {e}")
+                print(f"  {package} did not install: {e}", file=sys.stderr)
+                continue
+            print(f"\nGPU faiss installed from {package}.")
+            print("Submit with --device gpu. The job verifies the GPU index "
+                  "against a CPU one at startup and refuses if they disagree, "
+                  "so a wheel that imports but does not work costs a refusal "
+                  "rather than wrong cluster IDs.")
+            return
+        print("\nNo GPU faiss wheel installed for this container's Python:",
+              file=sys.stderr)
+        for line in errors:
+            print(f"  {line}", file=sys.stderr)
+        print("Stage 4 still runs on CPU; --device gpu is what needs this. "
+              "Sharding (--shards) is the CPU-side alternative and needs "
+              "nothing installed.", file=sys.stderr)
+        raise SystemExit(1)
 
     missing = [
         flag
